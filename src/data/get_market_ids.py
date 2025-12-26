@@ -59,6 +59,7 @@ def fetch_all_closed_events(
             params["endDateMin"] = end_date_min
         if end_date_max:
             params["endDateMax"] = end_date_max
+        params['start_date_min'] = "2025-06-01"
 
         resp = session.get(GAMMA_EVENTS_URL, params=params, timeout=30)
         resp.raise_for_status()
@@ -77,7 +78,6 @@ def fetch_all_closed_events(
         if got < limit:
             break
 
-        time.sleep(sleep_s)
 
 
 def flatten_event_to_market_rows(event: dict, verbose: bool = True) -> list[dict]:
@@ -269,9 +269,8 @@ if __name__ == "__main__":
 
     write_closed_markets_to_parquet(
         output_path=output_file,
-        limit=100,  # Gamma API page size
+        limit=500,  # Gamma API page size
         batch_size_rows=10000,  # controls memory use
         sleep_s=0.2,  # be nice to the API
-        end_date_min="2025-06-01",  # e.g. "2024-01-01"
         end_date_max=datetime.today().strftime("%Y-%m-%d"),  # e.g. "2025-06-01"
     )

@@ -1,80 +1,42 @@
-import requests
+import os
 import time
 import json
-import os
-import pandas as pd  # Core library for data handling
+import requests
+import pandas as pd
 from datetime import datetime, timedelta
+import uuid
+
+PRICES_HISTORY_URL = "https://clob.polymarket.com/prices-history"
 
 
-def fetch_market_details(limit=50):
+def parse_iso_datetime(iso_str: str):
     """
-    Fetches closed markets to get their start/end dates and token IDs.
+    Parses ISO timestamps like '2025-06-01T00:00:00Z' or '2025-06-01T00:00:00+00:00'
+    Returns timezone-aware datetime or None.
     """
-    url = "https://gamma-api.polymarket.com/events"
-
-    params = {
-        "limit": limit,
-        "closed": "true",
-        "order": "volume",
-        "ascending": "false",
-        "endDateMin": "2024-01-01",
-        "endDateMax": "2025-06-01",
-        "offset": "15",
-    }
-
+    if not iso_str or not isinstance(iso_str, str):
+        return None
     try:
-        response = requests.get(url, params=params)
-        response.raise_for_status()
-        data = response.json()
-
-        valid_markets = []
-        for event in data:
-            if not event.get('markets'): continue
-            market = event['markets'][0]
-
-            # Get token ID
-            raw_clob_ids = market.get('clobTokenIds', [])
-            if isinstance(raw_clob_ids, str):
-                try:
-                    raw_clob_ids = json.loads(raw_clob_ids.replace("'", '"'))
-                except:
-                    continue
-
-            if isinstance(raw_clob_ids, list) and len(raw_clob_ids) >= 2:
-                # We need start/end dates for pagination
-                start_iso = market.get('startDate') or market.get('creationDate')
-                end_iso = market.get('endDate')
-
-                if start_iso and end_iso:
-                    valid_markets.append({
-                        "question": market.get('question'),
-                        "start_date": start_iso,
-                        "end_date": end_iso,
-                        "token_id": raw_clob_ids[1]  # YES token
-                    })
-        return valid_markets
-    except Exception as e:
-        print(f"Error fetching markets: {e}")
-        return []
-
-
-def fetch_1m_data_chunked(token_id, start_iso, end_iso):
-    """
-    Loops through the date range in 7-day chunks to get 1-minute data.
-    """
-    url = "https://clob.polymarket.com/prices-history"
-    full_history = []
-
-    try:
-        start_dt = datetime.fromisoformat(start_iso.replace('Z', '+00:00'))
-        end_dt = datetime.fromisoformat(end_iso.replace('Z', '+00:00'))
+        return datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
     except ValueError:
+        return None
+
+
+def fetch_1m_data_chunked(session: requests.Session, token_id: str, start_iso: str, end_iso: str,
+                          chunk_days: int = 30, sleep_s: float = 0.25, timeout_s: int = 30):
+    """
+    Fetch minute-level history for one token_id from start_iso to end_iso using 7-day chunks.
+    Returns list of dicts like {'t': unix_ts, 'p': price}.
+    """
+    start_dt = parse_iso_datetime(start_iso)
+
+    end_dt = parse_iso_datetime(end_iso)
+    if start_dt is None or end_dt is None or start_dt >= end_dt:
         return []
 
+    full_history = []
     current_start = start_dt
-    chunk_size = timedelta(days=7)
-
-    print(f"  > Paginating from {start_dt.date()} to {end_dt.date()}...")
+    chunk_size = timedelta(days=chunk_days)
 
     while current_start < end_dt:
         current_end = min(current_start + chunk_size, end_dt)
@@ -85,86 +47,162 @@ def fetch_1m_data_chunked(token_id, start_iso, end_iso):
             "market": token_id,
             "startTs": ts_start,
             "endTs": ts_end,
-            "fidelity": 1
+            "fidelity": 1,  # 5-minute
         }
 
         try:
-            resp = requests.get(url, params=params)
+            resp = session.get(PRICES_HISTORY_URL, params=params, timeout=timeout_s)
             resp.raise_for_status()
             data = resp.json()
-            chunk_history = data.get('history', [])
-
+            chunk_history = data.get("history", [])
             if chunk_history:
                 full_history.extend(chunk_history)
-                print(f"    + Fetched {len(chunk_history)} points ({current_start.date()} -> {current_end.date()})")
-            else:
-                print(f"    . No data for {current_start.date()} -> {current_end.date()}")
-
-        except Exception as e:
-            print(f"    ! Error fetching chunk: {e}")
+        except Exception:
+            print(f"  ! Error fetching token_id={token_id} chunk {current_start} to {current_end}")
+            pass
 
         current_start = current_end
-        time.sleep(0.5)
+        ##time.sleep(sleep_s)
 
     return full_history
 
 
+def safe_filename(text: str, max_len: int = 80):
+    if not text:
+        return "market"
+    s = "".join(c if c.isalnum() else "_" for c in text)
+    s = s.strip("_")
+    return (s[:max_len] if len(s) > max_len else s) or "market"
+
+
 def main():
-    # Create a directory to keep things organized
-    output_dir = "data/polymarket_parquet"
-    os.makedirs(output_dir, exist_ok=True)
+    # --- INPUT: your metadata parquet from Script 1 ---
+    metadata_parquet = "/home/mithil/PycharmProjects/PolymarketPred/data/polymarket_parquet/closed_markets_metadata.parquet"
 
-    print("--- 1. Fetching Markets ---")
-    markets = fetch_market_details(limit=2)
+    # --- OUTPUT directory for minute-level series ---
+    out_dir = "/home/mithil/PycharmProjects/PolymarketPred/data/polymarket_minute_parquet"
+    os.makedirs(out_dir, exist_ok=True)
 
-    if not markets:
-        print("No markets found.")
+    # Choose which tokens to fetch:
+    FETCH_YES = True
+    FETCH_NO = False  # set True if you also want NO token histories
+
+    # Load metadata
+    meta = pd.read_parquet(metadata_parquet)[-100:]
+
+    # Keep only rows that have an end_date and at least one token id
+    meta = meta.copy()
+    meta["start_iso"] = meta["start_date"].fillna(meta["creation_date"])
+    meta = meta[meta["end_date"].notna()]
+    mapping_path = os.path.join(out_dir, "token_uuid_map.json")
+
+    # Load existing mapping if present (resume-safe)
+    if os.path.exists(mapping_path):
+        with open(mapping_path, "r") as f:
+            uuid_map = json.load(f)
+    else:
+        uuid_map = {}
+
+    # Build list of jobs: (token_id, question, start_iso, end_iso, market_id, event_id)
+    jobs = []
+    for _, row in meta.iterrows():
+        q = row.get("question")
+        start_iso = row.get("start_iso")
+        end_iso = row.get("end_date")
+        market_id = row.get("market_id")
+        event_id = row.get("event_id")
+
+        if FETCH_YES and pd.notna(row.get("yes_token_id")):
+            jobs.append(("YES", str(row["yes_token_id"]), q, start_iso, end_iso, market_id, event_id))
+
+        if FETCH_NO and pd.notna(row.get("no_token_id")):
+            jobs.append(("NO", str(row["no_token_id"]), q, start_iso, end_iso, market_id, event_id))
+
+    total_jobs = len(jobs)
+    if total_jobs == 0:
+        print("No token jobs found (check yes_token_id/no_token_id/end_date).")
         return
-    print(f"Fetched {len(markets)} markets.")
 
-    print("--- 2. Fetching Granular History ---")
-    for market in markets:
-        print(f"\nMarket: {market['question']}")
+    session = requests.Session()
 
-        history = fetch_1m_data_chunked(
-            market['token_id'],
-            market['start_date'],
-            market['end_date']
-        )
+    done = 0
+    skipped = 0
+    failed = 0
 
-        if history:
-            print(f"  > Processing {len(history)} records...")
+    try:
+        for side, token_id, question, start_iso, end_iso, market_id, event_id in jobs:
+            done += 1
 
-            # --- OPTIMIZED STORAGE IMPLEMENTATION ---
+            # output file per token
+            # Create deterministic key for this token
+            token_key = f"{side}:{token_id}"
 
-            # 1. Create DataFrame directly from the list of dicts
-            df = pd.DataFrame(history)
+            # Reuse UUID if already assigned
+            if token_key in uuid_map:
+                token_uuid = uuid_map[token_key]["uuid"]
+            else:
+                token_uuid = str(uuid.uuid4())
+                uuid_map[token_key] = {
+                    "uuid": token_uuid,
+                    "side": side,
+                    "token_id": token_id,
+                    "market_id": market_id,
+                    "event_id": event_id,
+                    "question": question,
+                    "created_at": datetime.now().isoformat() + "Z",
+                }
 
-            # 2. Rename columns to be descriptive (t -> timestamp, p -> price)
-            df = df.rename(columns={'t': 'timestamp', 'p': 'price'})
+            out_path = os.path.join(out_dir, f"{token_uuid}.parquet")
 
-            # 3. Optimize Data Types
-            # Convert Unix timestamp (int) to true datetime objects
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+            # Skip if already downloaded
+            if os.path.exists(out_path):
+                skipped += 1
+                print(
+                    f"\rMinute history | done {done}/{total_jobs} | skipped {skipped} | failed {failed}",
+                    end="",
+                    flush=True,
+                )
+                continue
 
-            # Downcast price to float32 (saves 50% memory vs float64, plenty of precision for prices)
-            df['price'] = df['price'].astype('float32')
+            history = fetch_1m_data_chunked(session, token_id, start_iso, end_iso)
 
-            # 4. Generate a clean filename
-            # Remove special characters from question to make it filesystem-safe
-            safe_question = "".join([c if c.isalnum() else "_" for c in market['question']])
-            # Truncate filename to avoid OS limits, append Token ID for uniqueness
-            filename = f"{safe_question[:50]}_{market['token_id']}.parquet"
-            file_path = os.path.join(output_dir, filename)
+            if not history:
+                failed += 1
+                print(
+                    f"\rMinute history | done {done}/{total_jobs} | skipped {skipped} | failed {failed}",
+                    end="",
+                    flush=True,
+                )
+                continue
 
-            # 5. Save as Parquet with ZSTD compression
-            df.to_parquet(file_path, engine='pyarrow', compression='zstd', index=False)
+            df = pd.DataFrame(history).rename(columns={"t": "timestamp", "p": "price"})
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
+            df["price"] = df["price"]
+            df = df.sort_values("timestamp").reset_index(drop=True)
+            # add identifiers so each file is self-describing
+            df["token_id"] = token_id
+            df["side"] = side
+            df["market_id"] = market_id
+            df["event_id"] = event_id
+            df["question"] = question
 
-            print(f"  > SUCCESS: Saved to {file_path}")
-            print(f"  > First: {df['timestamp'].iloc[0]} | Last: {df['timestamp'].iloc[-1]}")
+            df.to_parquet(out_path, engine="pyarrow", compression="zstd", index=False)
+            print(
+                f"\rMinute history | done {done}/{total_jobs} | skipped {skipped} | failed {failed}",
+                end="",
+                flush=True,
+            )
+            # Persist mapping safely after each successful save
+            with open(mapping_path, "w") as f:
+                json.dump(uuid_map, f, indent=2)
 
-        else:
-            print("  > No history found.")
+    finally:
+        session.close()
+
+    print()  # newline
+    print(
+        f"DONE ✅ tokens attempted={total_jobs} | skipped={skipped} | failed={failed} | saved={total_jobs - skipped - failed}")
+    print(f"Output folder: {out_dir}")
 
 
 if __name__ == "__main__":
