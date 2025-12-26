@@ -19,7 +19,7 @@ def fetch_market_details(limit=50):
         "ascending": "false",
         "endDateMin": "2024-01-01",
         "endDateMax": "2025-06-01",
-        "offset": "10",
+        "offset": "15",
     }
 
     try:
