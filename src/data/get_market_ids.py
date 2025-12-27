@@ -42,6 +42,7 @@ def fetch_all_closed_events(
         sleep_s: float = 0.25,
         end_date_min: str | None = None,
         end_date_max: str | None = None,
+        start_date_min: str | None = None,
 ):
     """
     Generator yielding events from Gamma API by paginating offset until exhaustion.
@@ -56,12 +57,14 @@ def fetch_all_closed_events(
             "ascending": "false",
         }
         if end_date_min:
-            params["endDateMin"] = end_date_min
+            params["end_date_min"] = end_date_min
         if end_date_max:
-            params["endDateMax"] = end_date_max
-        params['start_date_min'] = "2025-06-01"
+            params["end_date_max"] = end_date_max
+        if start_date_min:
+            params["start_date_min"] = start_date_min
 
         resp = session.get(GAMMA_EVENTS_URL, params=params, timeout=30)
+        print(resp.url)
         resp.raise_for_status()
         events = resp.json()
 
@@ -137,6 +140,8 @@ def flatten_event_to_market_rows(event: dict, verbose: bool = True) -> list[dict
         # include full list as JSON string (Parquet-friendly, reproducible)
         clob_ids_json = json.dumps(clob_ids, ensure_ascii=False)
 
+        if not isinstance(event_volume,float) or event_volume < 1000:
+            continue
         rows.append({
             # event-level
             "event_id": event_id,
@@ -179,6 +184,7 @@ def write_closed_markets_to_parquet(
         sleep_s: float = 0.25,
         end_date_min: str | None = None,
         end_date_max: str | None = None,
+        start_date_min: str | None = None,
 ):
     """
     Fetch all closed events -> flatten -> stream-write to one Parquet file.
@@ -200,6 +206,7 @@ def write_closed_markets_to_parquet(
                 sleep_s=sleep_s,
                 end_date_min=end_date_min,
                 end_date_max=end_date_max,
+                start_date_min=start_date_min,
         ):
             total_events += 1
             rows = flatten_event_to_market_rows(event)
@@ -272,5 +279,7 @@ if __name__ == "__main__":
         limit=500,  # Gamma API page size
         batch_size_rows=10000,  # controls memory use
         sleep_s=0.2,  # be nice to the API
-        end_date_max=datetime.today().strftime("%Y-%m-%d"),  # e.g. "2025-06-01"
+        end_date_min="2025-10-01",  # e.g. "2020-01-01"
+        end_date_max="2025-11-01",
+        start_date_min="2025-09-01",
     )

@@ -1,12 +1,14 @@
+import random
 import pandas as pd
 import plotly.graph_objects as go
-
+import glob
 # Path to ONE token parquet file
-parquet_path = "/home/mithil/PycharmProjects/PolymarketPred/data/polymarket_minute_parquet/1423e104-e850-4e7a-b07b-020f3624a38f.parquet"
-
+parquet_path = "/home/mithil/PycharmProjects/PolymarketPred/data/polymarket_minute_parquet/*.parquet"
+parquets = glob.glob(parquet_path)
+demo = random.choice(parquets)
 # Load data
-df = pd.read_parquet(parquet_path)
-
+df = pd.read_parquet(demo)
+print(df.head())
 # Ensure correct types
 df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
 df = df.sort_values("timestamp")

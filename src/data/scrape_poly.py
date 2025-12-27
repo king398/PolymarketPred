@@ -1,11 +1,13 @@
 import os
-import time
 import json
+import time
+import uuid
+import random
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
-import uuid
-
+from joblib import Parallel, delayed
+from tqdm import tqdm
 PRICES_HISTORY_URL = "https://clob.polymarket.com/prices-history"
 
 
@@ -22,14 +24,20 @@ def parse_iso_datetime(iso_str: str):
         return None
 
 
-def fetch_1m_data_chunked(session: requests.Session, token_id: str, start_iso: str, end_iso: str,
-                          chunk_days: int = 30, sleep_s: float = 0.25, timeout_s: int = 30):
+def fetch_1m_data_chunked(
+        session: requests.Session,
+        token_id: str,
+        start_iso: str,
+        end_iso: str,
+        chunk_days: int = 7,
+        sleep_s: float = 0.0,
+        timeout_s: int = 30,
+):
     """
-    Fetch minute-level history for one token_id from start_iso to end_iso using 7-day chunks.
+    Fetch minute-level history for one token_id from start_iso to end_iso using chunked windows.
     Returns list of dicts like {'t': unix_ts, 'p': price}.
     """
     start_dt = parse_iso_datetime(start_iso)
-
     end_dt = parse_iso_datetime(end_iso)
     if start_dt is None or end_dt is None or start_dt >= end_dt:
         return []
@@ -42,12 +50,11 @@ def fetch_1m_data_chunked(session: requests.Session, token_id: str, start_iso: s
         current_end = min(current_start + chunk_size, end_dt)
         ts_start = int(current_start.timestamp())
         ts_end = int(current_end.timestamp())
-
         params = {
             "market": token_id,
             "startTs": ts_start,
             "endTs": ts_end,
-            "fidelity": 1,  # 5-minute
+            "fidelity": 1,  # 1-minute
         }
 
         try:
@@ -58,21 +65,87 @@ def fetch_1m_data_chunked(session: requests.Session, token_id: str, start_iso: s
             if chunk_history:
                 full_history.extend(chunk_history)
         except Exception:
-            print(f"  ! Error fetching token_id={token_id} chunk {current_start} to {current_end}")
+            # keep going; caller can decide how to count failures
             pass
 
         current_start = current_end
-        ##time.sleep(sleep_s)
+        if sleep_s and sleep_s > 0:
+            time.sleep(sleep_s)
 
     return full_history
 
 
-def safe_filename(text: str, max_len: int = 80):
-    if not text:
-        return "market"
-    s = "".join(c if c.isalnum() else "_" for c in text)
-    s = s.strip("_")
-    return (s[:max_len] if len(s) > max_len else s) or "market"
+def _fetch_one_token_job(
+        *,
+        side: str,
+        token_id: str,
+        question: str,
+        start_iso: str,
+        end_iso: str,
+        market_id,
+        event_id,
+        out_path: str,
+        chunk_days: int,
+        timeout_s: int,
+        per_chunk_sleep_s: float,
+        max_retries: int = 2,
+):
+    """
+    Worker: fetch a single token_id and write a parquet to out_path.
+    Returns a tuple: (status, out_path, token_id, msg)
+    status in {"saved","skipped","failed"}
+    """
+    if os.path.exists(out_path):
+        return ("skipped", out_path, token_id, "already exists")
+
+    # small jitter to avoid thundering herd
+    time.sleep(random.uniform(0.0, 0.2))
+
+    for attempt in range(max_retries + 1):
+        session = requests.Session()
+        try:
+            history = fetch_1m_data_chunked(
+                session,
+                token_id,
+                start_iso,
+                end_iso,
+                chunk_days=chunk_days,
+                sleep_s=per_chunk_sleep_s,
+                timeout_s=timeout_s,
+            )
+
+            if not history:
+                raise RuntimeError("empty history")
+
+            df = pd.DataFrame(history).rename(columns={"t": "timestamp", "p": "price"})
+            # ensure UTC timestamps
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+            df = df.sort_values("timestamp").reset_index(drop=True)
+
+            # identifiers so each file is self-describing
+            df["token_id"] = token_id
+            df["side"] = side
+            df["market_id"] = market_id
+            df["event_id"] = event_id
+            df["question"] = question
+
+            tmp_path = out_path + ".tmp"
+            df.to_parquet(tmp_path, engine="pyarrow", compression="zstd", index=False)
+            os.replace(tmp_path, out_path)  # atomic-ish on same filesystem
+
+            return ("saved", out_path, token_id, "ok")
+
+        except Exception as e:
+            # backoff then retry
+            if attempt < max_retries:
+                time.sleep(0.5 * (2 ** attempt) + random.uniform(0.0, 0.3))
+            else:
+                return ("failed", out_path, token_id, f"{type(e).__name__}: {e}")
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
 
 
 def main():
@@ -87,13 +160,18 @@ def main():
     FETCH_YES = True
     FETCH_NO = False  # set True if you also want NO token histories
 
-    # Load metadata
-    meta = pd.read_parquet(metadata_parquet)[-100:]
+    # Parallelism / throttling
+    MAX_WORKERS = 32
+    PER_CHUNK_SLEEP_S = 0.00
+    CHUNK_DAYS = 15
+    TIMEOUT_S = 30
 
-    # Keep only rows that have an end_date and at least one token id
+    # Load metadata
+    meta = pd.read_parquet(metadata_parquet)
     meta = meta.copy()
     meta["start_iso"] = meta["start_date"].fillna(meta["creation_date"])
     meta = meta[meta["end_date"].notna()]
+
     mapping_path = os.path.join(out_dir, "token_uuid_map.json")
 
     # Load existing mapping if present (resume-safe)
@@ -103,8 +181,8 @@ def main():
     else:
         uuid_map = {}
 
-    # Build list of jobs: (token_id, question, start_iso, end_iso, market_id, event_id)
-    jobs = []
+    # Build jobs (side, token_id, question, start_iso, end_iso, market_id, event_id)
+    raw_jobs = []
     for _, row in meta.iterrows():
         q = row.get("question")
         start_iso = row.get("start_iso")
@@ -113,96 +191,93 @@ def main():
         event_id = row.get("event_id")
 
         if FETCH_YES and pd.notna(row.get("yes_token_id")):
-            jobs.append(("YES", str(row["yes_token_id"]), q, start_iso, end_iso, market_id, event_id))
-
+            raw_jobs.append(("YES", str(row["yes_token_id"]), q, start_iso, end_iso, market_id, event_id))
         if FETCH_NO and pd.notna(row.get("no_token_id")):
-            jobs.append(("NO", str(row["no_token_id"]), q, start_iso, end_iso, market_id, event_id))
+            raw_jobs.append(("NO", str(row["no_token_id"]), q, start_iso, end_iso, market_id, event_id))
 
-    total_jobs = len(jobs)
-    if total_jobs == 0:
+    if not raw_jobs:
         print("No token jobs found (check yes_token_id/no_token_id/end_date).")
         return
 
-    session = requests.Session()
+    # Pre-assign UUIDs (single-threaded) and build concrete tasks with out_path
+    tasks = []
+    newly_assigned = 0
 
-    done = 0
-    skipped = 0
-    failed = 0
+    for side, token_id, question, start_iso, end_iso, market_id, event_id in raw_jobs:
+        token_key = f"{side}:{token_id}"
 
-    try:
-        for side, token_id, question, start_iso, end_iso, market_id, event_id in jobs:
-            done += 1
+        if token_key in uuid_map:
+            token_uuid = uuid_map[token_key]["uuid"]
+        else:
+            token_uuid = str(uuid.uuid4())
+            uuid_map[token_key] = {
+                "uuid": token_uuid,
+                "side": side,
+                "token_id": token_id,
+                "market_id": market_id,
+                "event_id": event_id,
+                "question": question,
+                "created_at": datetime.now().isoformat() + "Z",
+            }
+            newly_assigned += 1
 
-            # output file per token
-            # Create deterministic key for this token
-            token_key = f"{side}:{token_id}"
+        out_path = os.path.join(out_dir, f"{token_uuid}.parquet")
 
-            # Reuse UUID if already assigned
-            if token_key in uuid_map:
-                token_uuid = uuid_map[token_key]["uuid"]
-            else:
-                token_uuid = str(uuid.uuid4())
-                uuid_map[token_key] = {
-                    "uuid": token_uuid,
-                    "side": side,
-                    "token_id": token_id,
-                    "market_id": market_id,
-                    "event_id": event_id,
-                    "question": question,
-                    "created_at": datetime.now().isoformat() + "Z",
-                }
-
-            out_path = os.path.join(out_dir, f"{token_uuid}.parquet")
-
-            # Skip if already downloaded
-            if os.path.exists(out_path):
-                skipped += 1
-                print(
-                    f"\rMinute history | done {done}/{total_jobs} | skipped {skipped} | failed {failed}",
-                    end="",
-                    flush=True,
+        # only enqueue if not already downloaded
+        if not os.path.exists(out_path):
+            tasks.append(
+                dict(
+                    side=side,
+                    token_id=token_id,
+                    question=question,
+                    start_iso=start_iso,
+                    end_iso=end_iso,
+                    market_id=market_id,
+                    event_id=event_id,
+                    out_path=out_path,
+                    chunk_days=CHUNK_DAYS,
+                    timeout_s=TIMEOUT_S,
+                    per_chunk_sleep_s=PER_CHUNK_SLEEP_S,
                 )
-                continue
-
-            history = fetch_1m_data_chunked(session, token_id, start_iso, end_iso)
-
-            if not history:
-                failed += 1
-                print(
-                    f"\rMinute history | done {done}/{total_jobs} | skipped {skipped} | failed {failed}",
-                    end="",
-                    flush=True,
-                )
-                continue
-
-            df = pd.DataFrame(history).rename(columns={"t": "timestamp", "p": "price"})
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
-            df["price"] = df["price"]
-            df = df.sort_values("timestamp").reset_index(drop=True)
-            # add identifiers so each file is self-describing
-            df["token_id"] = token_id
-            df["side"] = side
-            df["market_id"] = market_id
-            df["event_id"] = event_id
-            df["question"] = question
-
-            df.to_parquet(out_path, engine="pyarrow", compression="zstd", index=False)
-            print(
-                f"\rMinute history | done {done}/{total_jobs} | skipped {skipped} | failed {failed}",
-                end="",
-                flush=True,
             )
-            # Persist mapping safely after each successful save
-            with open(mapping_path, "w") as f:
-                json.dump(uuid_map, f, indent=2)
 
-    finally:
-        session.close()
+    # Persist mapping once (safe)
+    if newly_assigned > 0 or not os.path.exists(mapping_path):
+        with open(mapping_path, "w") as f:
+            json.dump(uuid_map, f, indent=2)
 
-    print()  # newline
-    print(
-        f"DONE ✅ tokens attempted={total_jobs} | skipped={skipped} | failed={failed} | saved={total_jobs - skipped - failed}")
+    total = len(raw_jobs)
+    to_fetch = len(tasks)
+    already = total - to_fetch
+    print(f"Total tokens in metadata: {total}")
+    print(f"Already present (skipped): {already}")
+    print(f"To fetch in parallel: {to_fetch}")
+    print(f"Workers: {MAX_WORKERS} | chunk_days={CHUNK_DAYS} | per_chunk_sleep={PER_CHUNK_SLEEP_S}s")
+
+    if to_fetch == 0:
+        print("Nothing to do ✅")
+        return
+
+    # Run parallel fetches
+    results = Parallel(n_jobs=MAX_WORKERS, backend="threading", prefer="threads")(
+        delayed(_fetch_one_token_job)(**t) for t in tqdm(tasks)
+    )
+
+    saved = sum(1 for r in results if r[0] == "saved")
+    skipped = already + sum(1 for r in results if r[0] == "skipped")
+    failed = sum(1 for r in results if r[0] == "failed")
+
+    # Optional: print failures
+    if failed:
+        print("\nFailures:")
+        for status, out_path, token_id, msg in results:
+            if status == "failed":
+                print(f" - token_id={token_id} -> {msg} ({out_path})")
+
+    print("\nDONE ✅")
+    print(f"attempted_total={total} | saved_now={saved} | skipped_total={skipped} | failed_now={failed}")
     print(f"Output folder: {out_dir}")
+    print(f"UUID map: {mapping_path}")
 
 
 if __name__ == "__main__":
