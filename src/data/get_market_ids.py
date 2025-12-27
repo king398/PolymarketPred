@@ -139,7 +139,7 @@ def flatten_event_to_market_rows(event: dict, verbose: bool = True) -> list[dict
         # include full list as JSON string (Parquet-friendly, reproducible)
         clob_ids_json = json.dumps(clob_ids, ensure_ascii=False)
 
-        if not isinstance(event_volume,float) or event_volume < 5000:
+        if not isinstance(event_volume,float) or event_volume < 25000:
             print(f"Skipping low-volume event {event_id} ({event_volume})")
             continue
         rows.append({
