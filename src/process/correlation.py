@@ -1,3 +1,5 @@
+import random
+
 from datasets import  Dataset
 import re
 import pandas as pd
@@ -25,12 +27,12 @@ ds_crypto = ds.filter(
     load_from_cache_file=True,
 )
 
-start = pd.Timestamp("2025-11-01", tz="UTC")
+start = pd.Timestamp("2025-10-01", tz="UTC")
 end = start + pd.Timedelta(days=7)  # exclusivea
 
 def in_range_batch(batch):
     ts = pd.to_datetime(batch["timestamp"], utc=True, errors="coerce")
-    return ts >= start
+    return (ts >= start) & (ts <= end)
 
 ds_range = ds_crypto.filter(
     in_range_batch,
@@ -83,7 +85,7 @@ print("Rows (crypto + date range):", len(ds_range))
 print("Unique questions:", len(ds_range.unique("question")))
 # plot
 
-question = df["question"].iloc[-1]
+question = random.choice(df["question"].unique())
 df_q = df[df["question"] == question].copy()
 
 df_q = df_q.sort_values("timestamp")
