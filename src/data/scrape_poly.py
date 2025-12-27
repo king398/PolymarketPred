@@ -167,7 +167,8 @@ def main():
     TIMEOUT_S = 30
 
     # Load metadata
-    meta = pd.read_parquet(metadata_parquet)
+    meta = pd.read_parquet(metadata_parquet)[:5000]
+
     meta = meta.copy()
     meta["start_iso"] = meta["start_date"].fillna(meta["creation_date"])
     meta = meta[meta["end_date"].notna()]

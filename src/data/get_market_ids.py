@@ -140,7 +140,6 @@ def flatten_event_to_market_rows(event: dict, verbose: bool = True) -> list[dict
         clob_ids_json = json.dumps(clob_ids, ensure_ascii=False)
 
         if not isinstance(event_volume,float) or event_volume < 25000:
-            print(f"Skipping low-volume event {event_id} ({event_volume})")
             continue
         rows.append({
             # event-level
@@ -279,6 +278,6 @@ if __name__ == "__main__":
         limit=500,  # Gamma API page size
         batch_size_rows=10000,  # controls memory use
         sleep_s=0.2,  # be nice to the API
-        end_date_max="2025-11-01",
-        start_date_min="2025-09-01",
+        end_date_max=datetime.now().strftime("%Y-%m-%d"),
+        start_date_min="2025-10-01",
     )
