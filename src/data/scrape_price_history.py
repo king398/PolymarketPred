@@ -150,7 +150,7 @@ def _fetch_one_token_job(
 
 def main():
     # --- INPUT: your metadata parquet from Script 1 ---
-    metadata_parquet = "/home/mithil/PycharmProjects/PolymarketPred/data/polymarket_parquet/closed_markets_metadata.parquet"
+    metadata_parquet = "/home/mithil/PycharmProjects/PolymarketPred/data/polymarket_parquet/closed_crypto_market_ids.parquet"
 
     # --- OUTPUT directory for minute-level series ---
     out_dir = "/home/mithil/PycharmProjects/PolymarketPred/data/polymarket_minute_parquet"
@@ -161,14 +161,14 @@ def main():
     FETCH_NO = False  # set True if you also want NO token histories
 
     # Parallelism / throttling
-    MAX_WORKERS = 32
+    MAX_WORKERS = 64
     PER_CHUNK_SLEEP_S = 0.00
     CHUNK_DAYS = 15
     TIMEOUT_S = 30
 
     # Load metadata
-    meta = pd.read_parquet(metadata_parquet)[:15000]
-
+    meta = pd.read_parquet(metadata_parquet)
+    print(meta)
     meta = meta.copy()
     meta["start_iso"] = meta["start_date"].fillna(meta["creation_date"])
     meta = meta[meta["end_date"].notna()]

@@ -38,6 +38,19 @@ def _safe_json_loads_maybe(s):
     return None
 
 
+def _first_nonempty(*vals):
+    """Return the first value that is a non-empty string (or a non-None non-str)."""
+    for v in vals:
+        if v is None:
+            continue
+        if isinstance(v, str):
+            if v.strip():
+                return v.strip()
+        else:
+            return v
+    return None
+
+
 def fetch_all_closed_events(
         session: requests.Session,
         limit: int = 100,
@@ -95,7 +108,8 @@ def flatten_event_to_market_rows(
     Convert one event -> rows, filtered to markets whose question (or optionally event title)
     matches crypto_pattern.
 
-    Only writes IDs + a couple helpful fields (question) for sanity.
+    Writes IDs + fields needed for downstream minute fetch:
+      - start_date, creation_date, end_date
     """
     rows = []
     markets = event.get("markets") or []
@@ -105,6 +119,13 @@ def flatten_event_to_market_rows(
     event_id = event.get("id")
     event_title = event.get("title") or event.get("name") or ""
     event_volume = event.get("volume")
+
+    # --- IMPORTANT: add these for Script 2 ---
+    # Gamma docs use camelCase: startDate, creationDate, endDate
+    # But sometimes you might see snake_case in other dumps, so handle both.
+    start_date = _first_nonempty(event.get("startDate"), event.get("start_date"))
+    creation_date = _first_nonempty(event.get("creationDate"), event.get("creation_date"))
+    end_date = _first_nonempty(event.get("endDate"), event.get("end_date"))
 
     # keep your event_volume filter (optional)
     if not isinstance(event_volume, (int, float)) or float(event_volume) < float(min_event_volume):
@@ -136,9 +157,14 @@ def flatten_event_to_market_rows(
             "condition_id": condition_id,
             "yes_token_id": yes_token_id,
             "no_token_id": no_token_id,
-            "question": question,          # keep for debugging; remove if you want only ids
-            "event_title": event_title,    # optional; remove if you want only ids
+            "question": question,
+            "event_title": event_title,
             "event_volume": float(event_volume) if event_volume is not None else None,
+
+            # ✅ needed by Script 2
+            "start_date": start_date,
+            "creation_date": creation_date,
+            "end_date": end_date,
         })
 
     return rows
@@ -180,7 +206,6 @@ def write_closed_crypto_markets_ids_to_parquet(
                 buffer.extend(rows)
                 total_markets_kept += len(rows)
 
-            # progress
             print(
                 f"\rScraping Closed Crypto Markets | "
                 f"Events: {total_events} | "
@@ -190,7 +215,6 @@ def write_closed_crypto_markets_ids_to_parquet(
                 flush=True
             )
 
-            # flush
             if len(buffer) >= batch_size_rows:
                 df = pd.DataFrame(buffer)
                 table = pa.Table.from_pandas(df, preserve_index=False)
@@ -202,7 +226,6 @@ def write_closed_crypto_markets_ids_to_parquet(
                 total_rows += len(buffer)
                 buffer = []
 
-        # final flush
         if buffer:
             df = pd.DataFrame(buffer)
             table = pa.Table.from_pandas(df, preserve_index=False)
@@ -235,5 +258,5 @@ if __name__ == "__main__":
         batch_size_rows=10_000,
         sleep_s=0.0,
         end_date_max=datetime.now().strftime("%Y-%m-%d"),
-        start_date_min="2025-09-01",
+        start_date_min="2025-10-01",
     )

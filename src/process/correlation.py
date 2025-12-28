@@ -29,7 +29,7 @@ ds_crypto = ds.filter(
     num_proc=32,
 )
 start = pd.Timestamp("2025-11-02", tz="UTC")
-end = start + pd.Timedelta(hours=4)
+end = start + pd.Timedelta(days=3)
 
 def in_range_batch(batch):
     ts = pd.to_datetime(batch["timestamp"], utc=True, errors="coerce")
