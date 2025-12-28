@@ -6,6 +6,7 @@ import glob
 parquet_path = "/home/mithil/PycharmProjects/PolymarketPred/data/polymarket_minute_parquet/*.parquet"
 parquets = glob.glob(parquet_path)
 demo = random.choice(parquets)
+demo = f"/home/mithil/PycharmProjects/PolymarketPred/data/polymarket_minute_parquet/703472fd-6f71-4a84-b386-b037e2c24532.parquet"
 # Load data
 df = pd.read_parquet(demo)
 print(df.head())

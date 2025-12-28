@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import re
 import requests
 import pandas as pd
 from datetime import datetime
@@ -9,6 +10,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
+
+# ---- your crypto pattern ----
+CRYPTO_PATTERN = re.compile(r"\b(bitcoin|ethereum|solana|xrp|btc|eth)\b", re.IGNORECASE)
 
 
 def _safe_json_loads_maybe(s):
@@ -24,11 +28,9 @@ def _safe_json_loads_maybe(s):
         s2 = s.strip()
         if not s2:
             return None
-        # try normal JSON first
         try:
             return json.loads(s2)
         except Exception:
-            # try replace single quotes -> double quotes
             try:
                 return json.loads(s2.replace("'", '"'))
             except Exception:
@@ -75,127 +77,91 @@ def fetch_all_closed_events(
 
         got = len(events)
         offset += got
-
-        # If returned fewer than limit, likely end of list
         if got < limit:
             break
 
+        if sleep_s:
+            time.sleep(sleep_s)
 
 
-def flatten_event_to_market_rows(event: dict, verbose: bool = True) -> list[dict]:
+def flatten_event_to_market_rows(
+        event: dict,
+        *,
+        crypto_pattern: re.Pattern = CRYPTO_PATTERN,
+        match_event_title_fallback: bool = True,
+        min_event_volume: float = 25_000.0,
+) -> list[dict]:
     """
-    Convert one event to many rows, one per market in event['markets'].
-    Includes event-level + market-level columns.
+    Convert one event -> rows, filtered to markets whose question (or optionally event title)
+    matches crypto_pattern.
+
+    Only writes IDs + a couple helpful fields (question) for sanity.
     """
     rows = []
     markets = event.get("markets") or []
     if not markets:
         return rows
 
-    # --- event-level fields (best-effort; Gamma fields can vary) ---
     event_id = event.get("id")
-    event_title = event.get("title") or event.get("name")
-    event_slug = event.get("slug")
-    event_category = event.get("category")
-    event_tags = event.get("tags")
-    event_created_at = event.get("createdAt") or event.get("creationDate")
-    event_start_date = event.get("startDate")
-    event_end_date = event.get("endDate")
+    event_title = event.get("title") or event.get("name") or ""
     event_volume = event.get("volume")
-    event_liquidity = event.get("liquidity")
+
+    # keep your event_volume filter (optional)
+    if not isinstance(event_volume, (int, float)) or float(event_volume) < float(min_event_volume):
+        return rows
+
+    # optional fallback: if event title is crypto-related, include markets even if question missing match
+    event_is_crypto = bool(crypto_pattern.search(event_title)) if match_event_title_fallback else False
 
     for m in markets:
-        # market-level fields
         market_id = m.get("id")
-        question = m.get("question")
+        question = (m.get("question") or "").strip()
         condition_id = m.get("conditionId")
-        market_slug = m.get("slug")
 
-        creation_date = m.get("creationDate")
-        start_date = m.get("startDate") or creation_date
-        end_date = m.get("endDate")
+        # match against question primarily
+        question_is_crypto = bool(crypto_pattern.search(question))
+        if not (question_is_crypto or event_is_crypto):
+            continue
 
-        volume = m.get("volume")
-        liquidity = m.get("liquidity")
-        closed = m.get("closed")
-        active = m.get("active")
-
-        # clob token ids
         raw_clob = m.get("clobTokenIds")
         clob_ids = _safe_json_loads_maybe(raw_clob) or []
 
-        # best-effort YES/NO interpretation:
-        # common convention: [NO, YES] -> index 0 NO, index 1 YES
-        no_token_id = None
-        yes_token_id = None
-        if isinstance(clob_ids, list):
-            if len(clob_ids) >= 1:
-                no_token_id = clob_ids[0]
-            if len(clob_ids) >= 2:
-                yes_token_id = clob_ids[1]
+        # common convention: [NO, YES]
+        no_token_id = clob_ids[0] if isinstance(clob_ids, list) and len(clob_ids) >= 1 else None
+        yes_token_id = clob_ids[1] if isinstance(clob_ids, list) and len(clob_ids) >= 2 else None
 
-
-
-        # include full list as JSON string (Parquet-friendly, reproducible)
-        clob_ids_json = json.dumps(clob_ids, ensure_ascii=False)
-
-        if not isinstance(event_volume,float) or event_volume < 25000:
-            continue
         rows.append({
-            # event-level
             "event_id": event_id,
-            "event_title": event_title,
-            "event_slug": event_slug,
-            "event_category": event_category,
-            "event_tags": json.dumps(event_tags, ensure_ascii=False) if event_tags is not None else None,
-            "event_created_at": event_created_at,
-            "event_start_date": event_start_date,
-            "event_end_date": event_end_date,
-            "event_volume": event_volume,
-            "event_liquidity": event_liquidity,
-
-            # market-level
             "market_id": market_id,
-            "market_slug": market_slug,
-            "question": question,
             "condition_id": condition_id,
-            "creation_date": creation_date,
-            "start_date": start_date,
-            "end_date": end_date,
-            "volume": volume,
-            "liquidity": liquidity,
-            "closed": closed,
-            "active": active,
-
-            # tokens
-            "clob_token_ids_json": clob_ids_json,
-            "no_token_id": no_token_id,
             "yes_token_id": yes_token_id,
+            "no_token_id": no_token_id,
+            "question": question,          # keep for debugging; remove if you want only ids
+            "event_title": event_title,    # optional; remove if you want only ids
+            "event_volume": float(event_volume) if event_volume is not None else None,
         })
 
     return rows
 
 
-def write_closed_markets_to_parquet(
+def write_closed_crypto_markets_ids_to_parquet(
         output_path: str,
-        limit: int = 100,
-        batch_size_rows: int = 50_000,
-        sleep_s: float = 0.25,
+        limit: int = 500,
+        batch_size_rows: int = 10_000,
+        sleep_s: float = 0.2,
         end_date_min: str | None = None,
         end_date_max: str | None = None,
         start_date_min: str | None = None,
 ):
-    """
-    Fetch all closed events -> flatten -> stream-write to one Parquet file.
-    """
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    total_markets = 0
 
     session = requests.Session()
-    buffer = []
+    buffer: list[dict] = []
     writer = None
+
     total_rows = 0
     total_events = 0
+    total_markets_kept = 0
     t0 = time.time()
 
     try:
@@ -212,38 +178,29 @@ def write_closed_markets_to_parquet(
 
             if rows:
                 buffer.extend(rows)
-                total_markets += len(rows)
+                total_markets_kept += len(rows)
 
-                print(
-                    f"\rScraping Polymarket | "
-                    f"Events: {total_events} | "
-                    f"Markets: {total_markets} | "
-                    f"Rows written: {total_rows}",
-                    end="",
-                    flush=True
-                )
+            # progress
+            print(
+                f"\rScraping Closed Crypto Markets | "
+                f"Events: {total_events} | "
+                f"Crypto markets kept: {total_markets_kept} | "
+                f"Rows written: {total_rows}",
+                end="",
+                flush=True
+            )
 
-
-            # flush when buffer big enough
+            # flush
             if len(buffer) >= batch_size_rows:
                 df = pd.DataFrame(buffer)
-
                 table = pa.Table.from_pandas(df, preserve_index=False)
+
                 if writer is None:
                     writer = pq.ParquetWriter(output_path, table.schema, compression="zstd")
-                writer.write_table(table)
 
+                writer.write_table(table)
                 total_rows += len(buffer)
                 buffer = []
-
-                print(
-                    f"\rScraping Polymarket | "
-                    f"Events: {total_events} | "
-                    f"Markets: {total_markets} | "
-                    f"Rows written: {total_rows}",
-                    end="",
-                    flush=True
-                )
 
         # final flush
         if buffer:
@@ -253,14 +210,15 @@ def write_closed_markets_to_parquet(
                 writer = pq.ParquetWriter(output_path, table.schema, compression="zstd")
             writer.write_table(table)
             total_rows += len(buffer)
-            buffer = []
 
         dt = time.time() - t0
         print()
-        print(    f"DONE ✅ Events: {total_events} | "
-                  f"Markets: {total_markets} | "
-                  f"Rows written: {total_rows} | "
-                  f"Time: {dt:.1f}s")
+        print(
+            f"DONE ✅ Events scanned: {total_events} | "
+            f"Crypto markets kept: {total_markets_kept} | "
+            f"Rows written: {total_rows} | "
+            f"Time: {dt:.1f}s"
+        )
 
     finally:
         if writer is not None:
@@ -269,15 +227,13 @@ def write_closed_markets_to_parquet(
 
 
 if __name__ == "__main__":
-    # You can remove end_date_min/end_date_max to fetch "everything closed" the API returns.
-    # Keeping them can reduce load if you only want a date window.
-    output_file = "/home/mithil/PycharmProjects/PolymarketPred/data/polymarket_parquet/closed_markets_metadata.parquet"
+    output_file = "/home/mithil/PycharmProjects/PolymarketPred/data/polymarket_parquet/closed_crypto_market_ids.parquet"
 
-    write_closed_markets_to_parquet(
+    write_closed_crypto_markets_ids_to_parquet(
         output_path=output_file,
-        limit=500,  # Gamma API page size
-        batch_size_rows=10000,  # controls memory use
-        sleep_s=0.2,  # be nice to the API
+        limit=500,
+        batch_size_rows=10_000,
+        sleep_s=0.0,
         end_date_max=datetime.now().strftime("%Y-%m-%d"),
-        start_date_min="2025-10-01",
+        start_date_min="2025-09-01",
     )
