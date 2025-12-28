@@ -28,8 +28,8 @@ ds_crypto = ds.filter(
     batch_size=50_000,
     num_proc=32,
 )
-start = pd.Timestamp("2025-11-02", tz="UTC")
-end = start + pd.Timedelta(days=3)
+start = pd.Timestamp("2025-10-02", tz="UTC")
+end = start + pd.Timedelta(days=2)
 
 def in_range_batch(batch):
     ts = pd.to_datetime(batch["timestamp"], utc=True, errors="coerce")
@@ -83,6 +83,16 @@ pivot_df = df.pivot_table(
 pivot_df.to_csv("polymarket_belief_updates.csv")
 print("Saved belief updates to 'polymarket_belief_updates.csv'")
 print(f"Matrix Shape: {pivot_df.shape} (Time x Markets)")
+# ---- PRICE PIVOT (for copula fair pricing) ----
+price_pivot = df.pivot_table(
+    index="timestamp_min",
+    columns="question",
+    values="price",
+    aggfunc="last"
+).ffill().dropna(how="all")  # forward fill for missing ticks
+price_pivot.to_csv("polymarket_price_pivot.csv")
+print("Saved price pivot to 'polymarket_price_pivot.csv'")
+print("Price Pivot Shape:", price_pivot.shape)
 
 # ---------------------------------------------------------------------------
 # 4. Optimized Lead-Lag Correlation (NumPy + Vectorization)

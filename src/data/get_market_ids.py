@@ -102,7 +102,7 @@ def flatten_event_to_market_rows(
         *,
         crypto_pattern: re.Pattern = CRYPTO_PATTERN,
         match_event_title_fallback: bool = True,
-        min_event_volume: float = 25_000.0,
+        min_event_volume: float = 1000.0,
 ) -> list[dict]:
     """
     Convert one event -> rows, filtered to markets whose question (or optionally event title)
@@ -160,8 +160,6 @@ def flatten_event_to_market_rows(
             "question": question,
             "event_title": event_title,
             "event_volume": float(event_volume) if event_volume is not None else None,
-
-            # ✅ needed by Script 2
             "start_date": start_date,
             "creation_date": creation_date,
             "end_date": end_date,
