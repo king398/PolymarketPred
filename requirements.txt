@@ -1,0 +1,13 @@
+websockets
+uvloop
+pandas
+plotly
+datasets
+requests
+pyarrow
+joblib
+tqdm
+numpy
+scipy
+networkx
+pillow

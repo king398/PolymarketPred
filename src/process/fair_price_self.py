@@ -4,7 +4,7 @@ import numpy as np
 import plotly.graph_objects as go
 from scipy.stats import kendalltau, norm
 
-top_k = 50
+top_k = 5
 eps = 1e-6
 
 df = pd.read_csv("/home/mithil/PycharmProjects/PolymarketPred/data/market_windows.csv")
@@ -17,7 +17,7 @@ df = df[
     ].reset_index(drop=True)
 df.to_csv("/home/mithil/PycharmProjects/PolymarketPred/data/market_windows_filtered.csv", index=False)
 # filter for those in between a certain duration range
-start_et = pd.Timestamp("2025-11-01 00:00", tz="US/Eastern")
+start_et = pd.Timestamp("2025-11-10 00:00", tz="US/Eastern")
 end_et = start_et + pd.Timedelta(days=1)
 
 # Convert ET → UTC for comparison
@@ -84,7 +84,7 @@ fig = go.Figure()
 print(f"\nTop {top_k} |Kendall τ| correlated market pairs:\n")
 for i, ((q1, q2), tau) in enumerate(top_pairs.items(), start=1):
     sign = "+" if tau > 0 else "-"
-    print(f"{i:02d}. τ={tau:+.4f} | {q1}  ↔  {q2}")
+    ##print(f"{i:02d}. τ={tau:+.4f} | {q1}  ↔  {q2}")
 
 # Pre-add all traces (2 per pair), then toggle visibility via dropdown
 visibility = []
@@ -217,7 +217,10 @@ def fair_price(
     v0 = empirical_cdf_value(B_series.values, pB_new)
     u_samp = sample_u_given_v_gaussian(v0, params["rho"], n_mc, seed)
 
-    A_samp = empirical_ppf(A_series.values, u_samp)
+    try:
+        A_samp = empirical_ppf(A_series.values, u_samp)
+    except Exception:
+        return None
 
     return {
         "tau": params["tau"],
@@ -231,71 +234,71 @@ def fair_price(
     }
 
 
-H = 10  # holding period in minutes
+H = 5  # holding period in minutes
 threshold = 0.03
 min_hist = 60
 n_mc = 10_000
-
-sample_pair = price_pivot[list(top_pairs.index[0])]
-A, B = top_pairs.index[1]
-
-price_A = price_pivot[A]
-price_B = price_pivot[B]
-df_ab = pd.concat([price_A.rename("A"), price_B.rename("B")], axis=1).dropna()
-
 trades = []
+for (A, B) in top_pairs.index:
+    print(f"Evaluating pair: {A} and {B}")
 
-for t_idx in range(min_hist, len(df_ab) - H):
-    hist = df_ab.iloc[:t_idx + 1]
+    price_A = price_pivot[A]
+    price_B = price_pivot[B]
+    df_ab = pd.concat([price_A.rename("A"), price_B.rename("B")], axis=1).dropna()
 
-    pA_now = hist["A"].iloc[-1]
-    pB_now = hist["B"].iloc[-1]  # conditioning value
 
-    result = fair_price(
-        A_series=hist["A"],
-        B_series=hist["B"],
-        pB_new=pB_now,
-        family="gaussian",
-        n_mc=n_mc,
-        seed=42,
-    )
-    if result is None:
-        continue
 
-    fair = result["fair_mean"]
-    mispricing = fair - pA_now
+    for t_idx in range(min_hist, len(df_ab) - H):
+        hist = df_ab.iloc[:t_idx + 1]
 
-    # Decide trade direction
-    if mispricing > threshold:
-        side = "YES"  # YES undervalued
-        s = +1
-    elif mispricing < -threshold:
-        side = "NO"  # YES overvalued => buy NO
-        s = -1
-    else:
-        continue  # no trade
+        pA_now = hist["A"].iloc[-1]
+        pB_now = hist["B"].iloc[-1]  # conditioning value
 
-    # Exit after H minutes
-    t_enter = hist.index[-1]
-    pA_exit = df_ab["A"].iloc[t_idx + H]
-    t_exit = df_ab.index[t_idx + H]
+        result = fair_price(
+            A_series=hist["A"],
+            B_series=hist["B"],
+            pB_new=pB_now,
+            family="gaussian",
+            n_mc=n_mc,
+            seed=42,
+        )
+        if result is None:
+            continue
 
-    # Profit per $1 notional (ignoring fees/slippage)
-    profit = s * (pA_exit - pA_now)
+        fair = result["fair_mean"]
+        mispricing = fair - pA_now
 
-    trades.append({
-        "t_enter": t_enter,
-        "t_exit": t_exit,
-        "side": side,
-        "pA_enter": float(pA_now),
-        "pA_exit": float(pA_exit),
-        "fair": float(fair),
-        "mispricing": float(mispricing),
-        "profit_per_$1": float(profit),
-        "tau": float(result["tau"]),
-        "param": float(result["copula_param"]),
-        "n_obs": int(result["n_obs"]),
-    })
+        # Decide trade direction
+        if mispricing > threshold:
+            side = "YES"  # YES undervalued
+            s = +1
+        #elif mispricing < -threshold:
+       #     side = "NO"  # YES overvalued => buy NO
+         #   s = -1
+        else:
+            continue  # no trade
+
+        # Exit after H minutes
+        t_enter = hist.index[-1]
+        pA_exit = df_ab["A"].iloc[t_idx + H]
+        t_exit = df_ab.index[t_idx + H]
+
+        # Profit per $1 notional (ignoring fees/slippage)
+        profit = s * (pA_exit - pA_now)
+
+        trades.append({
+            "t_enter": t_enter,
+            "t_exit": t_exit,
+            "side": side,
+            "pA_enter": float(pA_now),
+            "pA_exit": float(pA_exit),
+            "fair": float(fair),
+            "mispricing": float(mispricing),
+            "profit_per_$1": float(profit),
+            "tau": float(result["tau"]),
+            "param": float(result["copula_param"]),
+            "n_obs": int(result["n_obs"]),
+        })
 
 trades_df = pd.DataFrame(trades)
 
