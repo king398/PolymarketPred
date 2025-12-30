@@ -1,10 +1,12 @@
+import time
+
 import pandas as pd
 from datasets import Dataset
 import numpy as np
 import plotly.graph_objects as go
 from scipy.stats import kendalltau, norm
 
-top_k = 5
+top_k = 10
 eps = 1e-6
 
 df = pd.read_csv("/home/mithil/PycharmProjects/PolymarketPred/data/market_windows.csv")
@@ -164,7 +166,7 @@ def fit_copula_params(u: np.ndarray, v: np.ndarray, family: str = "gaussian") ->
     tau, _ = kendalltau(u, v)
     tau = float(np.clip(tau, -0.999, 0.999))
     fam = family.lower()
-
+      # temporary hack to bypass errors
     if fam == "gaussian":
         rho = float(np.clip(np.sin(np.pi * tau / 2.0), -0.999, 0.999))
         return {"tau": tau, "rho": rho}
@@ -208,7 +210,8 @@ def fair_price(
 ):
     u_A = pit_rank(A_series.values)
     u_B = pit_rank(B_series.values)
-
+    #u_A = A_series.values
+    #u_B = B_series.values
     try:
         params = fit_copula_params(u_A, u_B, family)
     except ValueError:
@@ -234,72 +237,99 @@ def fair_price(
     }
 
 
-H = 5  # holding period in minutes
+H = 20                 # holding period (minutes)
 threshold = 0.03
 min_hist = 60
-n_mc = 10_000
-trades = []
-for (A, B) in top_pairs.index:
-    print(f"Evaluating pair: {A} and {B}")
+eps = 1e-6
 
+trades = []
+
+start_profile_time = time.time()
+
+for (A, B) in top_pairs.index:
+    print(f"Evaluating pair: {A} ↔ {B}")
+
+    # --- Build aligned dataframe ONCE ---
     price_A = price_pivot[A]
     price_B = price_pivot[B]
-    df_ab = pd.concat([price_A.rename("A"), price_B.rename("B")], axis=1).dropna()
+    df_ab = pd.concat(
+        [price_A.rename("A"), price_B.rename("B")],
+        axis=1
+    ).dropna()
 
+    if len(df_ab) < min_hist + H:
+        continue
 
+    # --- NumPy views (NO pandas in loop) ---
+    A_vals = df_ab["A"].values
+    B_vals = df_ab["B"].values
+    times = df_ab.index.values
 
-    for t_idx in range(min_hist, len(df_ab) - H):
-        hist = df_ab.iloc[:t_idx + 1]
+    # --- PRECOMPUTE PIT + COPULA PARAMS (ONCE) ---
+    u_A_full = pit_rank(A_vals)
+    u_B_full = pit_rank(B_vals)
 
-        pA_now = hist["A"].iloc[-1]
-        pB_now = hist["B"].iloc[-1]  # conditioning value
+    params = fit_copula_params(u_A_full, u_B_full, "gaussian")
+    rho = params["rho"]
+    tau = params["tau"]
 
-        result = fair_price(
-            A_series=hist["A"],
-            B_series=hist["B"],
-            pB_new=pB_now,
-            family="gaussian",
-            n_mc=n_mc,
-            seed=42,
-        )
-        if result is None:
-            continue
+    # --- PRECOMPUTE SORTED ARRAYS FOR FAST CDF / PPF ---
+    A_sorted = np.sort(A_vals)
+    B_sorted = np.sort(B_vals)
+    nB = len(B_sorted)
 
-        fair = result["fair_mean"]
+    # ================= MAIN TIME LOOP =================
+    for t_idx in range(min_hist, len(A_vals) - H):
+
+        pA_now = A_vals[t_idx]
+        pB_now = B_vals[t_idx]
+
+        # --- Fast empirical CDF of B (O(log n)) ---
+        v0 = np.searchsorted(B_sorted, pB_now, side="right") / nB
+        v0 = np.clip(v0, eps, 1 - eps)
+
+        # --- Gaussian copula conditional expectation ---
+        z2 = norm.ppf(v0)
+        u_cond_mean = norm.cdf(rho * z2)
+
+        # --- Map back to A marginal ---
+        fair = np.quantile(A_sorted, u_cond_mean)
+
         mispricing = fair - pA_now
 
-        # Decide trade direction
+        # --- Trading rule ---
         if mispricing > threshold:
-            side = "YES"  # YES undervalued
+            side = "YES"
             s = +1
-        #elif mispricing < -threshold:
-       #     side = "NO"  # YES overvalued => buy NO
-         #   s = -1
         else:
-            continue  # no trade
+            continue
 
-        # Exit after H minutes
-        t_enter = hist.index[-1]
-        pA_exit = df_ab["A"].iloc[t_idx + H]
-        t_exit = df_ab.index[t_idx + H]
-
-        # Profit per $1 notional (ignoring fees/slippage)
-        profit = s * (pA_exit - pA_now)
+        # --- Exit after H minutes ---
+        pA_exit = A_vals[t_idx + H]
+        #profit = s * (pA_exit - pA_now)
+        profit = pA_exit - pA_now
+        roi = profit / max(pA_now, 1e-6)
 
         trades.append({
-            "t_enter": t_enter,
-            "t_exit": t_exit,
+            "t_enter": times[t_idx],
+            "t_exit": times[t_idx + H],
             "side": side,
             "pA_enter": float(pA_now),
             "pA_exit": float(pA_exit),
             "fair": float(fair),
             "mispricing": float(mispricing),
             "profit_per_$1": float(profit),
-            "tau": float(result["tau"]),
-            "param": float(result["copula_param"]),
-            "n_obs": int(result["n_obs"]),
+            "tau": float(tau),
+            "rho": float(rho),
+            "n_obs": int(len(A_vals)),
+            "profit_per_share": float(profit),
+            "roi": float(roi),
+
         })
 
+end_profile_time = time.time()
+average_time = (end_profile_time - start_profile_time) / max(1, len(top_pairs))
+print(f"Average time per pair: {average_time:.4f} seconds")
 trades_df = pd.DataFrame(trades)
 
 if len(trades_df) == 0:
@@ -317,16 +347,26 @@ else:
 
     # Optional: show worst/best trades
     print("\nTop 5 best trades:")
-    print(trades_df.sort_values("profit_per_$1", ascending=False).head(5)[
+
+    avg_roi = trades_df["roi"].mean()
+    med_roi = trades_df["roi"].median()
+    roi_win_rate = (trades_df["roi"] > 0).mean()
+    total_roi = trades_df["roi"].sum()
+    print("\n=== ROI Metrics ===")
+    print(f"Total ROI (sum):         {total_roi:+.4f}")
+    print(f"Avg ROI per trade:       {avg_roi:+.4f}")
+    print(f"Median ROI per trade:    {med_roi:+.4f}")
+    print(f"Win rate (ROI):          {roi_win_rate * 100:.1f}%")
+
+    print(trades_df.sort_values("roi", ascending=False).head(5)[
               ["t_enter", "side", "pA_enter", "pA_exit", "fair", "mispricing", "profit_per_$1"]
           ])
 
     print("\nTop 5 worst trades:")
-    print(trades_df.sort_values("profit_per_$1", ascending=True).head(5)[
+    print(trades_df.sort_values("roi", ascending=True).head(5)[
               ["t_enter", "side", "pA_enter", "pA_exit", "fair", "mispricing", "profit_per_$1"]
           ])
-
-    # Save for analysis
+# Save for analysis
     out_path = "/home/mithil/PycharmProjects/PolymarketPred/data/fair_price_backtest_trades.csv"
     trades_df.to_csv(out_path, index=False)
     print(f"\nSaved trades to: {out_path}")
