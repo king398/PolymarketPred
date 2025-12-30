@@ -2,14 +2,31 @@ import asyncio
 import websockets
 import json
 import time
-import aiofiles
 import re
 from typing import Any, Dict, List, Optional, Tuple, Set
 
-WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-ASSET_ID = "115193106500252441347057856539225168339065498062654799670373647667592722696153"
+# Try to use orjson for speed, fallback to standard json
+try:
+    import orjson
+    json_lib = orjson
+except ImportError:
+    import json
+    json_lib = json
 
-OUTPUT_FILE = "market_quotes.jsonl"
+WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+ASSET_ID_FILE = "/home/mithil/PycharmProjects/PolymarketPred/data/clob_token_ids.jsonl"
+
+# Load Asset IDs
+ASSET_IDS = []
+try:
+    with open(ASSET_ID_FILE, "r") as f:
+        for line in f:
+            if line.strip():
+                # Use standard json here as it's a one-time load
+                ASSET_IDS.append(json.loads(line)["clob_token_id"])
+except FileNotFoundError:
+    print(f"Error: Could not find {ASSET_ID_FILE}")
+    ASSET_IDS = []
 
 # TCP broadcast server
 BIND_HOST = "127.0.0.1"
@@ -17,179 +34,152 @@ BIND_PORT = 9000
 
 _LEADING_NUM_PREFIX = re.compile(r"^\s*\d+")
 
-
 def _decode_events(raw: str) -> List[Dict[str, Any]]:
     s = raw.strip()
     if s and s[0].isdigit():
         s = _LEADING_NUM_PREFIX.sub("", s, count=1).lstrip()
-    obj = json.loads(s)
+
+    try:
+        obj = json_lib.loads(s)
+    except Exception:
+        return []
+
     if isinstance(obj, dict):
         return [obj]
     if isinstance(obj, list):
         return [x for x in obj if isinstance(x, dict)]
     return []
 
-
-def _best_from_book(book_msg: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
-    bids = book_msg.get("bids") or []
-    asks = book_msg.get("asks") or []
-    best_bid = max((float(x["price"]) for x in bids), default=None)
-    best_ask = min((float(x["price"]) for x in asks), default=None)
-    return best_bid, best_ask
-
-
 class Broadcaster:
-    """
-    Simple TCP "fanout":
-      - multiple clients connect
-      - every update is sent as one JSON line (NDJSON)
-      - on connect, we optionally send the last known quote immediately
-    """
     def __init__(self) -> None:
         self.clients: Set[asyncio.StreamWriter] = set()
-        self.lock = asyncio.Lock()
-        self.last_line: Optional[bytes] = None
+        # Removed lock for pure speed (asyncio is single threaded)
 
-    async def add(self, writer: asyncio.StreamWriter) -> None:
-        async with self.lock:
-            self.clients.add(writer)
-            # Send last quote immediately (nice for new clients)
-            if self.last_line is not None:
-                try:
-                    writer.write(self.last_line)
-                    await writer.drain()
-                except Exception:
-                    self.clients.discard(writer)
+    def add(self, writer: asyncio.StreamWriter):
+        self.clients.add(writer)
 
-    async def remove(self, writer: asyncio.StreamWriter) -> None:
-        async with self.lock:
-            self.clients.discard(writer)
+    def remove(self, writer: asyncio.StreamWriter):
+        self.clients.discard(writer)
         try:
             writer.close()
-            await writer.wait_closed()
         except Exception:
             pass
 
-    async def broadcast_line(self, line: bytes) -> None:
-        # remember last
-        self.last_line = line
-        async with self.lock:
-            writers = list(self.clients)
-
-        if not writers:
+    def broadcast_line(self, line: bytes):
+        if not self.clients:
             return
 
-        dead: List[asyncio.StreamWriter] = []
-        for w in writers:
+        # Optimistic write (no await) to keep the feed moving fast
+        dead = []
+        for w in self.clients:
             try:
                 w.write(line)
             except Exception:
                 dead.append(w)
 
-        # Drain in a second pass (avoids one slow client blocking the others too hard)
-        for w in writers:
-            if w in dead:
-                continue
-            try:
-                await w.drain()
-            except Exception:
-                dead.append(w)
-
-        if dead:
-            async with self.lock:
-                for w in dead:
-                    self.clients.discard(w)
-                    try:
-                        w.close()
-                    except Exception:
-                        pass
-
+        for w in dead:
+            self.remove(w)
 
 async def tcp_server(b: Broadcaster) -> None:
-    async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    async def handle_client(reader, writer):
         addr = writer.get_extra_info("peername")
-        print(f"[TCP] client connected: {addr}")
-        await b.add(writer)
+        print(f"[TCP] New client: {addr}")
+        b.add(writer)
         try:
-            # keep connection open; if client sends anything, we ignore
-            while True:
-                data = await reader.read(1024)
-                if not data:
-                    break
+            # Keep connection open until client disconnects
+            await reader.read()
         except Exception:
             pass
         finally:
-            print(f"[TCP] client disconnected: {addr}")
-            await b.remove(writer)
+            print(f"[TCP] Client disconnected: {addr}")
+            b.remove(writer)
 
     server = await asyncio.start_server(handle_client, BIND_HOST, BIND_PORT)
-    addrs = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
-    print(f"[TCP] broadcasting on {addrs}")
+    print(f"[TCP] Broadcasting on {BIND_HOST}:{BIND_PORT}")
     async with server:
         await server.serve_forever()
 
-
 async def stream_polymarket_and_publish(b: Broadcaster) -> None:
-    print(f"[WS] Streaming ONLY asset_id={ASSET_ID}")
+    print(f"[WS] Streaming {len(ASSET_IDS)} assets...")
+
+    # Dictionary to track last known state: { asset_id: (bid, ask) }
+    # This prevents sending duplicate data if the price hasn't actually changed
+    market_state = {aid: (None, None) for aid in ASSET_IDS}
 
     async with websockets.connect(
             WS_URL,
-            ping_interval=20,
-            ping_timeout=20,
-            close_timeout=10,
+            ping_interval=None, # Disable ping for lower latency
             max_size=None,
     ) as ws:
-        await ws.send(json.dumps({
-            "type": "market",
-            "assets_ids": [ASSET_ID],
-        }))
 
-        best_bid: Optional[float] = None
-        best_ask: Optional[float] = None
-        last_written: Tuple[Optional[float], Optional[float]] = (None, None)
+        # Subscribe
+        sub_msg = {"type": "market", "assets_ids": ASSET_IDS}
+        await ws.send(json.dumps(sub_msg) if json_lib == json else json_lib.dumps(sub_msg).decode())
 
-        async with aiofiles.open(OUTPUT_FILE, "a") as f:
-            async for msg in ws:
-                try:
-                    events = _decode_events(msg)
-                except json.JSONDecodeError:
-                    continue
+        async for msg in ws:
+            # 1. Decode
+            events = _decode_events(msg)
 
-                for data in events:
-                    ts_ms = int(data.get("timestamp", time.time() * 1000))
-                    et = data.get("event_type")
+            for data in events:
+                ts_ms = data.get("timestamp") or int(time.time() * 1000)
+                et = data.get("event_type")
 
-                    if et == "book" and data.get("asset_id") == ASSET_ID:
-                        b0, a0 = _best_from_book(data)
-                        if b0 is not None:
-                            best_bid = b0
-                        if a0 is not None:
-                            best_ask = a0
+                updates = [] # List of (asset_id, bid, ask)
 
-                    elif et == "price_change":
-                        for ch in data.get("price_changes", []):
-                            if ch.get("asset_id") != ASSET_ID:
-                                continue
-                            if ch.get("best_bid") is not None:
-                                best_bid = float(ch["best_bid"])
-                            if ch.get("best_ask") is not None:
-                                best_ask = float(ch["best_ask"])
+                # 2. Extract Data
+                if et == "price_change":
+                    changes = data.get("price_changes") or []
+                    if not changes and "asset_id" in data:
+                        changes = [data]
 
-                    current = (best_bid, best_ask)
-                    if current != last_written and any(v is not None for v in current):
-                        out = {"ts_ms": ts_ms, "bid": best_bid, "ask": best_ask}
+                    for ch in changes:
+                        aid = ch.get("asset_id")
+                        # Only process if this is an asset we care about
+                        if aid in market_state:
+                            updates.append((aid, ch.get("best_bid"), ch.get("best_ask")))
+
+                elif et == "book":
+                    aid = data.get("asset_id")
+                    if aid in market_state:
+                        bids = data.get("bids") or []
+                        asks = data.get("asks") or []
+                        # Safely get price or None
+                        bb = float(bids[0]["price"]) if bids else None
+                        ba = float(asks[0]["price"]) if asks else None
+                        updates.append((aid, bb, ba))
+
+                # 3. Update State & Broadcast (O(1) - only for changed assets)
+                for aid, new_bid_raw, new_ask_raw in updates:
+                    # Retrieve current state
+                    last_bid, last_ask = market_state[aid]
+
+                    # Parse new values (keep old if new is None)
+                    current_bid = float(new_bid_raw) if new_bid_raw is not None else last_bid
+                    current_ask = float(new_ask_raw) if new_ask_raw is not None else last_ask
+
+                    # If nothing changed, skip
+                    if (current_bid == last_bid) and (current_ask == last_ask):
+                        continue
+
+                    # Update State
+                    market_state[aid] = (current_bid, current_ask)
+
+                    # Prepare Output
+                    out = {
+                        "ts_ms": ts_ms,
+                        "asset_id": aid,
+                        "bid": current_bid,
+                        "ask": current_ask
+                    }
+
+                    # Serialize and Broadcast
+                    if json_lib == json:
                         line_str = json.dumps(out, separators=(",", ":")) + "\n"
                         line = line_str.encode("utf-8")
+                    else:
+                        line = json_lib.dumps(out) + b"\n"
 
-                        # write to file (optional but you wanted it)
-                        await f.write(line_str)
-                        await f.flush()
-
-                        # broadcast to all TCP clients
-                        await b.broadcast_line(line)
-
-                        last_written = current
-
+                    b.broadcast_line(line)
 
 async def main():
     b = Broadcaster()
@@ -198,9 +188,15 @@ async def main():
         stream_polymarket_and_publish(b),
     )
 
-
 if __name__ == "__main__":
     try:
+        # Optional: Use uvloop if available for linux performance
+        try:
+            import uvloop
+            uvloop.install()
+        except ImportError:
+            pass
+
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nStopped.")

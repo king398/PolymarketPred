@@ -1,152 +1,107 @@
 import asyncio
 import json
+import math
 import time
-import threading
-from queue import Queue, Empty
-from typing import Any, Dict, Optional, Tuple
-
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
 
 HOST = "127.0.0.1"
 PORT = 9000
 
-# ---- plotting controls ----
-MAX_POINTS = 600          # keep last N points in memory (e.g., 10 min @ 1 Hz)
-PLOT_FPS = 30             # UI refresh rate (not network rate)
 
+BUCKET_MS = 100
 
-def _extract_point(msg: Dict[str, Any]) -> Optional[Tuple[float, Optional[float], Optional[float]]]:
-    """
-    Return (t_seconds, bid, ask, last) for plotting.
-    Adjust these keys to match your server output.
-    """
-    # time axis
-    ts_ms = msg.get("ts_ms")
-    if isinstance(ts_ms, (int, float)):
-        t = float(ts_ms) / 1000.0
-    else:
-        t = time.time()
+def emit(bucket_start_ms, asset_id, bid, ask):
+    rec = {
+        "ts": int(bucket_start_ms),
+        "asset_id": asset_id,
+        "bid": bid,
+        "ask": ask,
+    }
+    # Fast JSON dump
+    line = json.dumps(rec, separators=(",", ":"))
+    now_ms = time.time_ns() // 1_000_000
+    lag = now_ms - bucket_start_ms
+    print(f"Lag {lag} | {line}", flush=True)
 
-    # common field name variants
-    bid = msg.get("best_bid", msg.get("bid"))
-    ask = msg.get("best_ask", msg.get("ask"))
-
-    def _to_float(x):
-        if x is None:
-            return None
-        try:
-            return float(x)
-        except Exception:
-            return None
-
-    return (t, _to_float(bid), _to_float(ask))
-
-
-async def tcp_reader(out_q: Queue):
+async def process_market_data():
+    print(f"Connecting to tcp://{HOST}:{PORT}...", flush=True)
     reader, writer = await asyncio.open_connection(HOST, PORT)
-    print(f"Connected to tcp://{HOST}:{PORT}")
+    print("Connected! Aggregating buckets...", flush=True)
 
-    buffer = b""
+
+    # State tracking per Asset ID
+    # Structure: { asset_id: { "last_bid": float, "last_ask": float, "next_boundary": int } }
+    state = {}
+
     try:
         while True:
-            chunk = await reader.read(4096)
-            if not chunk:
-                raise ConnectionError("Server closed connection.")
-            buffer += chunk
-
-            while b"\n" in buffer:
-                line, buffer = buffer.split(b"\n", 1)
-                if not line.strip():
-                    continue
-                try:
-                    msg = json.loads(line.decode("utf-8"))
-                except json.JSONDecodeError:
-                    continue
-
-                pt = _extract_point(msg)
-                if pt is not None:
-                    out_q.put(pt)
-    finally:
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except Exception:
-            pass
-
-
-def run_async_client(out_q: Queue):
-    asyncio.run(tcp_reader(out_q))
-
-
-def main():
-    q: Queue = Queue()
-
-    # Start asyncio TCP client in background thread
-    t = threading.Thread(target=run_async_client, args=(q,), daemon=True)
-    t.start()
-
-    # Live plot state
-    xs, bids, asks = [], [], []
-
-    fig, ax = plt.subplots()
-    line_bid, = ax.plot([], [], label="best_bid")
-    line_ask, = ax.plot([], [], label="best_ask")
-    ax.set_title("Live Market Stream")
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Price / Probability")
-    ax.legend(loc="upper left")
-
-    def init():
-        ax.relim()
-        ax.autoscale_view()
-        return line_bid, line_ask
-
-    def update(_frame):
-        # Drain queue (non-blocking)
-        drained = 0
-        while True:
-            try:
-                t_sec, bid, ask = q.get_nowait()
-            except Empty:
+            line = await reader.readline()
+            if not line:
                 break
 
-            xs.append(t_sec)
-            bids.append(bid)
-            asks.append(ask)
-            drained += 1
 
-        if drained == 0:
-            return line_bid, line_ask
+            # 2. Parse
+            try:
+                line_str = line.strip()
+                if not line_str: continue
+                msg = json.loads(line_str)
 
-        # Keep last MAX_POINTS
-        if len(xs) > MAX_POINTS:
-            xs[:] = xs[-MAX_POINTS:]
-            bids[:] = bids[-MAX_POINTS:]
-            asks[:] = asks[-MAX_POINTS:]
+                # Handle raw types safely
+                # Ensure ts_ms handles both int and string input
+                ts_ms = int(msg["ts_ms"])
+                aid = msg["asset_id"]
 
-        # Convert Nones to NaNs so matplotlib breaks the line cleanly
-        import math
-        def _nanify(arr):
-            return [x if (x is not None) else math.nan for x in arr]
+                # Get Price (handle potential None or missing keys safely)
+                raw_bid = msg.get("bid")
+                raw_ask = msg.get("ask")
 
-        line_bid.set_data(xs, _nanify(bids))
-        line_ask.set_data(xs, _nanify(asks))
+                # If data is missing prices (rare but possible), skip or use defaults
+                if raw_bid is None or raw_ask is None:
+                    continue
 
-        ax.relim()
-        ax.autoscale_view()
+                bid = float(raw_bid)
+                ask = float(raw_ask)
 
-        # Optional: show only recent window in X
-        ax.set_xlim(xs[0], xs[-1])
+            except (ValueError, KeyError, json.JSONDecodeError):
+                continue
 
-        return line_bid, line_ask
+            # 3. Initialize New Asset if unseen
+            if aid not in state:
+                # Align to the next grid boundary
+                first_boundary = (math.floor(ts_ms / BUCKET_MS) + 1) * BUCKET_MS
+                state[aid] = {
+                    "last_bid": bid,
+                    "last_ask": ask,
+                    "next_boundary": first_boundary
+                }
+                continue
 
-    ani = FuncAnimation(fig, update, init_func=init, interval=int(1000 / PLOT_FPS), blit=False)
-    plt.show()
+            # 4. Forward Fill Logic (Per Asset)
+            asset_state = state[aid]
 
+            # While the current message time is past the asset's next bucket boundary
+            while ts_ms >= asset_state["next_boundary"]:
+                # Emit the LKV (state BEFORE this new tick) for that boundary
+                emit(
+                    asset_state["next_boundary"],
+                    aid,
+                    asset_state["last_bid"],
+                    asset_state["last_ask"],
+
+                )
+                asset_state["next_boundary"] += BUCKET_MS
+
+            # 5. Update State (LKV)
+            asset_state["last_bid"] = bid
+            asset_state["last_ask"] = ask
+
+    except ConnectionError:
+        print("Connection lost")
+    finally:
+        writer.close()
+        await writer.wait_closed()
 
 if __name__ == "__main__":
     try:
-        main()
+        asyncio.run(process_market_data())
     except KeyboardInterrupt:
         print("\nStopped.")

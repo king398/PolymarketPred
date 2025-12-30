@@ -5,8 +5,9 @@ from datasets import Dataset
 import numpy as np
 import plotly.graph_objects as go
 from scipy.stats import kendalltau, norm
+from scipy.stats import rankdata
 
-top_k = 10
+top_k = 25
 eps = 1e-6
 
 df = pd.read_csv("/home/mithil/PycharmProjects/PolymarketPred/data/market_windows.csv")
@@ -14,13 +15,14 @@ df["end_ts_utc"] = pd.to_datetime(df["end_ts_utc"], utc=True)
 df["start_ts_utc"] = pd.to_datetime(df["start_ts_utc"], utc=True)
 df = df.sort_values(by="end_ts_utc").reset_index(drop=True)
 df = df[
-    (df['duration_hours'] >= 24) &
-    (df['status'] == "ok")
+    (df["status"] == "ok") &
+    (df["question"].str.contains("Up", na=False))
     ].reset_index(drop=True)
+print(f"Filtered markets count: {len(df)}")
 df.to_csv("/home/mithil/PycharmProjects/PolymarketPred/data/market_windows_filtered.csv", index=False)
 # filter for those in between a certain duration range
-start_et = pd.Timestamp("2025-11-10 00:00", tz="US/Eastern")
-end_et = start_et + pd.Timedelta(days=1)
+start_et = pd.Timestamp("2025-10-05 00:00", tz="US/Eastern")
+end_et = start_et + pd.Timedelta(hours=4)
 
 # Convert ET → UTC for comparison
 start_utc = start_et.tz_convert("UTC")
@@ -35,7 +37,7 @@ parquets = [f"/home/mithil/PycharmProjects/PolymarketPred/data/polymarket_minute
 dataset = Dataset.from_parquet(parquets).to_pandas()
 dataset["timestamp_et"] = dataset["timestamp"].dt.tz_convert("US/Eastern")
 
-target_date = pd.Timestamp("2025-11-01").date()
+target_date = pd.Timestamp("2025-10-05").date()
 
 dataset_day = dataset[
     dataset["timestamp_et"].dt.date == target_date
@@ -82,71 +84,7 @@ N = min(top_k, len(top_pairs))
 pairs = list(top_pairs.index[:N])
 taus = top_pairs.values[:N]
 
-fig = go.Figure()
-print(f"\nTop {top_k} |Kendall τ| correlated market pairs:\n")
-for i, ((q1, q2), tau) in enumerate(top_pairs.items(), start=1):
-    sign = "+" if tau > 0 else "-"
-    ##print(f"{i:02d}. τ={tau:+.4f} | {q1}  ↔  {q2}")
 
-# Pre-add all traces (2 per pair), then toggle visibility via dropdown
-visibility = []
-for i, ((q1, q2), tau) in enumerate(zip(pairs, taus)):
-    pair_df = price_pivot[[q1, q2]].copy()
-
-    # normalize for comparability
-    pair_df = pair_df
-
-    fig.add_trace(go.Scatter(
-        x=pair_df.index, y=pair_df[q1],
-        mode="lines", name=q1[:80],
-        visible=(i == 0),
-        hovertemplate="Time: %{x}<br>Norm: %{y:.4f}<extra></extra>",
-    ))
-    fig.add_trace(go.Scatter(
-        x=pair_df.index, y=pair_df[q2],
-        mode="lines", name=q2[:80],
-        visible=(i == 0),
-        hovertemplate="Time: %{x}<br>Norm: %{y:.4f}<extra></extra>",
-    ))
-
-# Build dropdown buttons
-buttons = []
-for i, ((q1, q2), tau) in enumerate(zip(pairs, taus)):
-    vis = [False] * (2 * N)
-    vis[2 * i] = True
-    vis[2 * i + 1] = True
-
-    label = f"{i + 1:02d} | τ={tau:.3f} | {q1[:35]}  ↔  {q2[:35]}"
-    buttons.append(dict(
-        label=label,
-        method="update",
-        args=[
-            {"visible": vis},
-            {"title": f"Top Kendall τ Pair #{i + 1} (normalized)<br>τ = {tau:.4f}"}
-        ],
-    ))
-
-fig.update_layout(
-    title=f"Top Kendall τ Pair #1 (normalized)<br>τ = {taus[0]:.4f}",
-    template="plotly_dark",
-    height=650,
-    hovermode="x unified",
-    updatemenus=[dict(
-        buttons=buttons,
-        direction="down",
-        x=0.0,
-        y=1.15,
-        xanchor="left",
-        yanchor="top",
-    )],
-    margin=dict(t=120),
-    legend=dict(orientation="h", y=1.02, x=0),
-)
-
-fig.update_xaxes(title="Time (US/Eastern)", rangeslider=dict(visible=True))
-fig.update_yaxes(title="Normalized price (p / p0)")
-
-fig.show()
 def empirical_cdf_value(sample: np.ndarray, x0: float) -> float:
     """Empirical CDF value F(x0) from sample."""
     sample = np.asarray(sample, dtype=float)
@@ -157,33 +95,9 @@ def pit_rank(x: np.ndarray) -> np.ndarray:
     """Empirical PIT using ranks -> values in (0,1)."""
     x = np.asarray(x, dtype=float)
     n = x.size
-    ranks = pd.Series(x).rank(method="average").to_numpy()
+    ranks = rankdata(x, method="average")
     u = (ranks - 0.5) / n
     return np.clip(u, eps, 1 - eps)
-
-
-def fit_copula_params(u: np.ndarray, v: np.ndarray, family: str = "gaussian") -> dict:
-    tau, _ = kendalltau(u, v)
-    tau = float(np.clip(tau, -0.999, 0.999))
-    fam = family.lower()
-      # temporary hack to bypass errors
-    if fam == "gaussian":
-        rho = float(np.clip(np.sin(np.pi * tau / 2.0), -0.999, 0.999))
-        return {"tau": tau, "rho": rho}
-
-    if fam == "clayton":
-        if tau <= 0:
-            raise ValueError("Clayton requires positive dependence (tau > 0).")
-        theta = float(2 * tau / (1 - tau))
-        return {"tau": tau, "theta": theta}
-
-    if fam == "gumbel":
-        if tau < 0:
-            raise ValueError("Gumbel typically assumes tau >= 0.")
-        theta = float(1.0 / (1 - tau))
-        return {"tau": tau, "theta": theta}
-
-    raise ValueError("family must be one of: gaussian, clayton, gumbel")
 
 
 def sample_u_given_v_gaussian(v0: float, rho: float, n: int, seed: int) -> np.ndarray:
@@ -192,54 +106,59 @@ def sample_u_given_v_gaussian(v0: float, rho: float, n: int, seed: int) -> np.nd
     z1 = rng.normal(loc=rho * z2, scale=np.sqrt(1 - rho ** 2), size=n)
     return np.clip(norm.cdf(z1), eps, 1 - eps)
 
-
-def empirical_ppf(sample: np.ndarray, q: np.ndarray) -> np.ndarray:
-    """Empirical inverse CDF (quantile)."""
+def empirical_ppf(sample: np.ndarray, q) -> float:
+    """Empirical inverse CDF (quantile). Returns float."""
     sample = np.asarray(sample, dtype=float)
-    q = np.asarray(q, dtype=float)
-    return np.quantile(sample, q, method="linear")
+
+    q = float(q)  # ensure scalar
+    if not np.isfinite(q):
+        return np.nan
+
+    q = float(np.clip(q, eps, 1 - eps))
+    return float(np.quantile(sample, q, method="linear"))
 
 
 def fair_price(
         A_series: pd.Series,
         B_series: pd.Series,
         pB_new: float,
-        family: str,
-        n_mc: int = 5000,
-        seed: int = 42,
 ):
+    """
+    Gaussian copula ONLY
+    Deterministic, no Monte Carlo, no leakage
+    """
+
+    # PIT
     u_A = pit_rank(A_series.values)
     u_B = pit_rank(B_series.values)
-    #u_A = A_series.values
-    #u_B = B_series.values
-    try:
-        params = fit_copula_params(u_A, u_B, family)
-    except ValueError:
-        return None
 
+    # Fit Gaussian copula via Kendall tau
+    tau, _ = kendalltau(u_A, u_B)
+    tau = float(np.clip(tau, -0.999, 0.999))
+    rho = float(np.clip(np.sin(np.pi * tau / 2.0), -0.999, 0.999))
+
+    # Percentile of B at current price
     v0 = empirical_cdf_value(B_series.values, pB_new)
-    u_samp = sample_u_given_v_gaussian(v0, params["rho"], n_mc, seed)
 
-    try:
-        A_samp = empirical_ppf(A_series.values, u_samp)
-    except Exception:
-        return None
+    # Conditional mean in copula space
+    z = norm.ppf(v0)
+    u_cond_mean = norm.cdf(rho * z)
+
+    # Map back to price space
+    fair = float(empirical_ppf(A_series.values, u_cond_mean))
 
     return {
-        "tau": params["tau"],
-        "copula_param": params.get("rho", params.get("theta", np.nan)),
+        "tau": tau,
+        "copula_param": rho,
         "pB_new": float(pB_new),
-        "fair_mean": float(np.mean(A_samp)),
-        "fair_median": float(np.median(A_samp)),
-        "fair_p10": float(np.quantile(A_samp, 0.10)),
-        "fair_p90": float(np.quantile(A_samp, 0.90)),
+        "fair_mean": fair,
         "n_obs": int(len(u_A)),
     }
 
 
-H = 20                 # holding period (minutes)
+H = 20  # holding period (minutes)
 threshold = 0.03
-min_hist = 60
+min_hist = 120
 eps = 1e-6
 
 trades = []
@@ -247,7 +166,9 @@ trades = []
 start_profile_time = time.time()
 
 for (A, B) in top_pairs.index:
-    print(f"Evaluating pair: {A} ↔ {B}")
+    pair_tau = float(kendall_corr.loc[A, B])  # from the precomputed matrix
+    print(f"Evaluating pair: {A} ↔ {B} | pair_tau={pair_tau:+.4f}")
+
 
     # --- Build aligned dataframe ONCE ---
     price_A = price_pivot[A]
@@ -266,70 +187,105 @@ for (A, B) in top_pairs.index:
     times = df_ab.index.values
 
     # --- PRECOMPUTE PIT + COPULA PARAMS (ONCE) ---
-    u_A_full = pit_rank(A_vals)
-    u_B_full = pit_rank(B_vals)
-
-    params = fit_copula_params(u_A_full, u_B_full, "gaussian")
-    rho = params["rho"]
-    tau = params["tau"]
-
-    # --- PRECOMPUTE SORTED ARRAYS FOR FAST CDF / PPF ---
-    A_sorted = np.sort(A_vals)
-    B_sorted = np.sort(B_vals)
-    nB = len(B_sorted)
 
     # ================= MAIN TIME LOOP =================
-    for t_idx in range(min_hist, len(A_vals) - H):
+    for t_idx in range(min_hist, len(df_ab) - H):
+
+        # --- expanding history ONLY (no leakage) ---
+        A_hist = df_ab["A"].iloc[:t_idx + 1]
+        B_hist = df_ab["B"].iloc[:t_idx + 1]
 
         pA_now = A_vals[t_idx]
         pB_now = B_vals[t_idx]
 
-        # --- Fast empirical CDF of B (O(log n)) ---
-        v0 = np.searchsorted(B_sorted, pB_now, side="right") / nB
-        v0 = np.clip(v0, eps, 1 - eps)
+        # --- Fair(A | B) ---
+        res_A = fair_price(
+            A_series=A_hist,
+            B_series=B_hist,
+            pB_new=pB_now,
+        )
+        if res_A is None:
+            continue
+        fairA = res_A["fair_mean"]
+        misA = fairA - pA_now  # + => A undervalued vs fair
 
-        # --- Gaussian copula conditional expectation ---
-        z2 = norm.ppf(v0)
-        u_cond_mean = norm.cdf(rho * z2)
+        # --- Fair(B | A) ---
+        res_B = fair_price(
+            A_series=B_hist,  # swap!
+            B_series=A_hist,
+            pB_new=pA_now,  # swap conditioning price!
+        )
+        if res_B is None:
+            continue
+        fairB = res_B["fair_mean"]
+        misB = fairB - pB_now  # + => B undervalued vs fair
 
-        # --- Map back to A marginal ---
-        fair = np.quantile(A_sorted, u_cond_mean)
+        # --- Decide which market is more out-of-fair ---
+        # (use absolute deviation; trade the bigger dislocation)
+        if abs(misA) >= abs(misB):
+            trade_market = "A"
+            fair = fairA
+            mispricing = misA
+            tau = res_A["tau"]
+            rho = res_A["copula_param"]
+            p_enter = pA_now
+            p_exit = A_vals[t_idx + H]
+        else:
+            trade_market = "B"
+            fair = fairB
+            mispricing = misB
+            tau = res_B["tau"]
+            rho = res_B["copula_param"]
+            p_enter = pB_now
+            p_exit = B_vals[t_idx + H]
 
-        mispricing = fair - pA_now
-
-        # --- Trading rule ---
+        # --- Trading rule (same as before, but applied to chosen market) ---
         if mispricing > threshold:
             side = "YES"
             s = +1
         else:
             continue
 
-        # --- Exit after H minutes ---
-        pA_exit = A_vals[t_idx + H]
-        #profit = s * (pA_exit - pA_now)
-        profit = pA_exit - pA_now
-        roi = profit / max(pA_now, 1e-6)
+        profit = p_exit - p_enter
+        roi = profit / max(p_enter, 1e-6)
 
         trades.append({
             "t_enter": times[t_idx],
             "t_exit": times[t_idx + H],
+
+            "pair_A": A,
+            "pair_B": B,
+            "trade_market": trade_market,  # "A" or "B"
+
             "side": side,
+
+            # record BOTH currents + BOTH fairs
             "pA_enter": float(pA_now),
-            "pA_exit": float(pA_exit),
+            "pB_enter": float(pB_now),
+            "fairA": float(fairA),
+            "fairB": float(fairB),
+            "misA": float(misA),
+            "misB": float(misB),
+
+            # record the chosen trade’s numbers
+            "p_enter": float(p_enter),
+            "p_exit": float(p_exit),
             "fair": float(fair),
             "mispricing": float(mispricing),
+
             "profit_per_$1": float(profit),
-            "tau": float(tau),
-            "rho": float(rho),
-            "n_obs": int(len(A_vals)),
             "profit_per_share": float(profit),
             "roi": float(roi),
 
+            "tau": float(tau),
+            "rho": float(rho),
+            "n_obs": int(len(A_hist)),
         })
 
 end_profile_time = time.time()
 average_time = (end_profile_time - start_profile_time) / max(1, len(top_pairs))
 print(f"Average time per pair: {average_time:.4f} seconds")
+
 trades_df = pd.DataFrame(trades)
 
 if len(trades_df) == 0:
@@ -358,15 +314,11 @@ else:
     print(f"Median ROI per trade:    {med_roi:+.4f}")
     print(f"Win rate (ROI):          {roi_win_rate * 100:.1f}%")
 
-    print(trades_df.sort_values("roi", ascending=False).head(5)[
-              ["t_enter", "side", "pA_enter", "pA_exit", "fair", "mispricing", "profit_per_$1"]
-          ])
+    print(trades_df.sort_values("roi", ascending=False).head(5))
 
     print("\nTop 5 worst trades:")
-    print(trades_df.sort_values("roi", ascending=True).head(5)[
-              ["t_enter", "side", "pA_enter", "pA_exit", "fair", "mispricing", "profit_per_$1"]
-          ])
-# Save for analysis
+    print(trades_df.sort_values("roi", ascending=True).head(5))
+    # Save for analysis
     out_path = "/home/mithil/PycharmProjects/PolymarketPred/data/fair_price_backtest_trades.csv"
     trades_df.to_csv(out_path, index=False)
     print(f"\nSaved trades to: {out_path}")
