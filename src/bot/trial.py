@@ -2,12 +2,19 @@ import asyncio
 import json
 import math
 import time
-
+from collections import deque
+from numpy_ringbuffer import RingBuffer
+import numpy as np
 HOST = "127.0.0.1"
 PORT = 9000
 
-
-BUCKET_MS = 100
+asset_id_que = {}
+BUCKET_MS = 1
+tick_dtype = np.dtype([
+    ("ts_ms", np.int64),
+    ("bid",   np.float32),
+    ("ask",   np.float32),
+])
 
 def emit(bucket_start_ms, asset_id, bid, ask):
     rec = {
@@ -19,8 +26,7 @@ def emit(bucket_start_ms, asset_id, bid, ask):
     # Fast JSON dump
     line = json.dumps(rec, separators=(",", ":"))
     now_ms = time.time_ns() // 1_000_000
-    lag = now_ms - bucket_start_ms
-    print(f"Lag {lag} | {line}", flush=True)
+    asset_id_que[asset_id].append((now_ms, bid, ask))
 
 async def process_market_data():
     print(f"Connecting to tcp://{HOST}:{PORT}...", flush=True)
@@ -37,8 +43,6 @@ async def process_market_data():
             line = await reader.readline()
             if not line:
                 break
-
-
             # 2. Parse
             try:
                 line_str = line.strip()
@@ -50,11 +54,8 @@ async def process_market_data():
                 ts_ms = int(msg["ts_ms"])
                 aid = msg["asset_id"]
 
-                # Get Price (handle potential None or missing keys safely)
                 raw_bid = msg.get("bid")
                 raw_ask = msg.get("ask")
-
-                # If data is missing prices (rare but possible), skip or use defaults
                 if raw_bid is None or raw_ask is None:
                     continue
 
@@ -73,6 +74,8 @@ async def process_market_data():
                     "last_ask": ask,
                     "next_boundary": first_boundary
                 }
+                asset_id_que[aid] = RingBuffer(capacity=4096, dtype=tick_dtype)
+                asset_id_que[aid].append((ts_ms, bid, ask))
                 continue
 
             # 4. Forward Fill Logic (Per Asset)

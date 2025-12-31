@@ -20,7 +20,7 @@ bucket_start_et = now_et.replace(
 
 bucket_starts_15_min = [
     int((bucket_start_et + timedelta(minutes=15 * i)).timestamp())
-    for i in range(3)
+    for i in range(2)
 ]
 print(bucket_starts_15_min)
 print("Now ET:", now_et)
@@ -63,9 +63,8 @@ bucket_start_et_day = now_et.replace(
 )
 bucket_starts_1_day = [
     f"{dt.strftime('%B').lower()}-{dt.day}"
-    for dt in (bucket_start_et_day + timedelta(days=i) for i in range(2))
+    for dt in (bucket_start_et_day + timedelta(days=i) for i in range(1))
 ]
-print(bucket_starts_1_day)
 for symbol in crypto_names:
     for i, timestamp in enumerate(bucket_starts_1_day):
         r = requests.get(f"https://gamma-api.polymarket.com/events/slug/{symbol}-up-or-down-on-{timestamp}")
@@ -78,9 +77,8 @@ for symbol in crypto_names:
 
 bucket_starts_weekly = [
     f"{dt.strftime('%B').lower()}-{dt.day}"
-    for dt in (bucket_start_et_day + timedelta(days=i) for i in range(5))
+    for dt in (bucket_start_et_day + timedelta(days=i) for i in range(3))
 ]
-print(bucket_starts_weekly)
 for symbol in crypto_names:
     for i, timestamp in enumerate(bucket_starts_weekly):
         r = requests.get(f"https://gamma-api.polymarket.com/events/slug/{symbol}-above-on-{timestamp}")
@@ -91,13 +89,13 @@ for symbol in crypto_names:
             except KeyError as e:
                 continue
             max_price = max([float(x) for x in max_price])
-            if float(max_price) > 0.96:
+            if float(max_price) > 0.95:
                 continue
             yes_clob_token_id = eval(market_data["clobTokenIds"])[0]
-            ##all_clob_token_ids.append(
-             ##   {"slug": data['slug'], "clob_token_id": yes_clob_token_id, "market_position": i, "category": "weekly",
-             ##    "primary_market_timestamp": str(bucket_start_et_day + timedelta(days=i)),
-              ##   "question": market_data["question"]})
+            #all_clob_token_ids.append(
+            #   {"slug": data['slug'], "clob_token_id": yes_clob_token_id, "market_position": i, "category": "weekly",
+            #     "primary_market_timestamp": str(bucket_start_et_day + timedelta(days=i)),
+            #     "question": market_data["question"]})
 
 #print(all_clob_token_ids)
 print(len(all_clob_token_ids))
