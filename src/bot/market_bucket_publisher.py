@@ -4,13 +4,14 @@ import math
 import time
 from numpy_ringbuffer import RingBuffer
 import numpy as np
-import zmq
+import zmq.asyncio
 
 HOST = "127.0.0.1"
 PORT = 9000
 BUCKET_SIZE = 600
 asset_id_que = {}
-BUCKET_MS = 1000
+BUCKET_MS = 100
+BROADCAST_INTERVAL_S = 1.0
 tick_dtype = np.dtype([
     ("ts_ms", np.int64),
     ("bid",   np.float32),
@@ -24,8 +25,6 @@ pub.bind(ZMQ_PUB)
 
 def emit(bucket_start_ms, asset_id, bid, ask):
     asset_id_que[asset_id].append((int(bucket_start_ms), bid, ask))
-    if len(asset_id_que[asset_id]) == BUCKET_SIZE:
-        print(f"Filled bucket for asset {asset_id}:")
 
 async def process_market_data():
     print(f"Connecting to tcp://{HOST}:{PORT}...", flush=True)
@@ -103,7 +102,7 @@ async def process_market_data():
         await writer.wait_closed()
 async def publish_all_assets_every_1s():
     while True:
-        await asyncio.sleep(BUCKET_MS / 1000.0)
+        await asyncio.sleep(BROADCAST_INTERVAL_S)
         # Snapshot keys to avoid dict-size-change issues
         asset_ids = list(asset_id_que.keys())
 
@@ -112,7 +111,7 @@ async def publish_all_assets_every_1s():
             if rb is None or len(rb) == 0:
                 continue
 
-            arr = np.asarray(rb)
+            arr = np.asarray(rb,copy=True)
 
 
 
