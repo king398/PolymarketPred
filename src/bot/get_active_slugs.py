@@ -96,6 +96,25 @@ for symbol in crypto_names:
             #   {"slug": data['slug'], "clob_token_id": yes_clob_token_id, "market_position": i, "category": "weekly",
             #     "primary_market_timestamp": str(bucket_start_et_day + timedelta(days=i)),
             #     "question": market_data["question"]})
+bucket_start_et_4h = now_et.replace(
+    hour=(now_et.hour // 4) * 4,
+    minute=0,
+    second=0,
+    microsecond=0
+)
+bucket_starts_4h = [
+    int((bucket_start_et_4h + timedelta(hours=4 * i)).timestamp())
+    for i in range(1)  # current + next 4h bucket
+]
+for symbol in crypto_symbols:
+    for i, unix_ts in enumerate(bucket_starts_4h):
+        r = requests.get(f"https://gamma-api.polymarket.com/events/slug/{symbol}-updown-4h-{unix_ts}")
+        data = r.json()
+        yes_clob_token_id = eval(data["markets"][0]["clobTokenIds"])[0]
+        all_clob_token_ids.append(
+            {"slug": data['slug'], "clob_token_id": yes_clob_token_id, "market_position": i, "category": "4h",
+             "primary_market_timestamp": str(datetime.fromtimestamp(unix_ts, ET)),
+             "question": data["markets"][0]["question"]})
 
 #print(all_clob_token_ids)
 print(len(all_clob_token_ids))
