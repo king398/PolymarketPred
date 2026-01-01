@@ -162,16 +162,14 @@ async def main():
     while True:
         start_time = datetime.now(tz=ET)
         print(f"\n[System] Fetch cycle started at {start_time.strftime('%H:%M:%S')}...")
-
         try:
             async with aiohttp.ClientSession() as session:
                 all_data = []
 
                 # 1. 15 Minute
-                # print("Fetching 15m...")
+                print("Fetching 15m...")
                 all_data.extend(await process_standard_markets(
-                    session, "15m", SYMBOLS_SHORT, "15m", 2, "{symbol}-updown-15m-{param}"
-                ))
+                    session, "15m", SYMBOLS_SHORT, "15m", 2, "{symbol}-updown-15m-{param}"))
 
                 # 2. 1 Hour
                 # print("Fetching 1h...")

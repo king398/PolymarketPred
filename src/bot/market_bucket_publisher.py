@@ -5,16 +5,16 @@ import time
 from numpy_ringbuffer import RingBuffer
 import numpy as np
 import zmq
+from market_websocket import ASSET_ID_FILE
 
 HOST = "127.0.0.1"
 PORT = 9000
 
-BUCKET_MS = 100
+BUCKET_MS = 500
 BUCKET_SIZE = 8192
 BROADCAST_INTERVAL_S = 1.0
 
 # --- Filter Config ---
-# Adjust these based on your asset's real price range
 MIN_VALID_PRICE = 0.00
 MAX_VALID_PRICE = 0.99
 
@@ -29,16 +29,20 @@ asset_id_que: dict[str, RingBuffer] = {}
 state: dict[str, dict] = {}
 state_lock = asyncio.Lock()
 
+# Global whitelist (updated dynamically by the publisher loop)
+valid_clobs = set()
+
 ZMQ_PUB = "tcp://127.0.0.1:5567"
 ctx = zmq.Context.instance()
 pub = ctx.socket(zmq.PUB)
 pub.bind(ZMQ_PUB)
 
 def emit(bucket_start_ms: int, aid: str, bid: float, ask: float):
-    # assumes asset_id_que[aid] exists
-    asset_id_que[aid].append((int(bucket_start_ms), float(bid), float(ask)))
+    if aid in asset_id_que:
+        asset_id_que[aid].append((int(bucket_start_ms), float(bid), float(ask)))
 
 async def process_market_data():
+    """Ingests raw TCP data, filters it, and updates state."""
     print(f"Connecting to tcp://{HOST}:{PORT}...", flush=True)
     reader, writer = await asyncio.open_connection(HOST, PORT)
     print("Connected! Tracking last bid/ask per asset...", flush=True)
@@ -55,27 +59,26 @@ async def process_market_data():
                     continue
                 msg = json.loads(s)
 
-                ts_ms = int(msg["ts_ms"])
                 aid = msg["asset_id"]
+
+                # OPTIONAL: Check against the global whitelist.
+                # Even though the publisher prunes, this prevents us from
+                # creating NEW buffers for assets that were just removed.
+                if valid_clobs and aid not in valid_clobs:
+                    continue
 
                 raw_bid = msg.get("bid")
                 raw_ask = msg.get("ask")
 
-                # 1. Basic Null Check
                 if raw_bid is None or raw_ask is None:
                     continue
 
                 bid = float(raw_bid)
                 ask = float(raw_ask)
 
-                # 2. DATA QUALITY FILTER (The Fix)
-                # Ignore placeholder/reset values so they don't poison the state
                 if bid <= MIN_VALID_PRICE or ask >= MAX_VALID_PRICE:
-                    # Optional: Print once to confirm we are catching them
-                    # print(f"Ignored garbage tick: {bid}/{ask}")
                     continue
 
-                # 3. Sanity Check: Crossed Market (optional but recommended)
                 if bid > ask:
                     continue
 
@@ -85,7 +88,6 @@ async def process_market_data():
             async with state_lock:
                 if aid not in state:
                     now_ms = int(time.time() * 1000)
-                    # Align to next grid point
                     first_boundary = (math.floor(now_ms / BUCKET_MS) + 1) * BUCKET_MS
 
                     state[aid] = {
@@ -94,11 +96,8 @@ async def process_market_data():
                         "next_boundary": first_boundary,
                     }
                     asset_id_que[aid] = RingBuffer(capacity=BUCKET_SIZE, dtype=tick_dtype)
-
-                    # Seed the first point
                     emit(first_boundary, aid, bid, ask)
                 else:
-                    # Update LKV (Last Known Value)
                     st = state[aid]
                     st["last_bid"] = bid
                     st["last_ask"] = ask
@@ -113,47 +112,77 @@ async def process_market_data():
         await writer.wait_closed()
 
 async def bucket_timer():
-    """
-    Every BUCKET_MS, forward-fill each asset up to now_ms using last_bid/ask.
-    """
+    """Periodically forward-fills the price buckets."""
     sleep_s = BUCKET_MS / 1000.0
-
     while True:
-        # Calculate now once per loop
         now_ms = int(time.time() * 1000)
-
         async with state_lock:
-            # Snapshot keys to allow safe iteration
             aids = list(state.keys())
-
             for aid in aids:
                 st = state[aid]
-
-                # Forward fill all missed buckets up to current time
-                # If data stopped coming, this repeats the last good price.
                 while st["next_boundary"] <= now_ms:
                     emit(st["next_boundary"], aid, st["last_bid"], st["last_ask"])
                     st["next_boundary"] += BUCKET_MS
-
-        # Sleep accounting for drift could be added, but simple sleep is usually fine
         await asyncio.sleep(sleep_s)
 
 async def publish_all_assets_every_1s():
+    """
+    1. Loads the latest valid CLOBs from file.
+    2. Prunes any memory state for IDs that are no longer in the file.
+    3. Publishes the remaining valid assets via ZMQ.
+    """
+    global valid_clobs
+
     while True:
         await asyncio.sleep(BROADCAST_INTERVAL_S)
 
-        # Snapshot keys
-        asset_ids = list(asset_id_que.keys())
+        # 1. READ FILE (Refresh Whitelist)
+        current_valid_ids = set()
+        try:
+            with open(ASSET_ID_FILE, "r") as f:
+                for line in f:
+                    if line.strip():
+                        try:
+                            obj = json.loads(line)
+                            current_valid_ids.add(obj["clob_token_id"])
+                        except json.JSONDecodeError:
+                            pass
 
-        for aid in asset_ids:
-            rb = asset_id_que.get(aid)
-            if rb is None or len(rb) == 0:
-                continue
+            # Update global set so process_market_data sees it too
+            if len(current_valid_ids) > 0:
+                valid_clobs = current_valid_ids
+            else:
+                # Safety: If file is empty or read failed, don't wipe everything immediately?
+                # Or if you WANT to wipe everything if file is empty, remove this check.
+                pass
 
-            # Creating an array from RingBuffer is safe in asyncio
-            # (no context switch inside np.array constructor)
-            arr = np.array(rb, copy=True)
-            pub.send_multipart([aid.encode(), arr.tobytes()])
+        except Exception as e:
+            print(f"Error reading asset file: {e}")
+            # If read fails, skip pruning this tick to be safe
+            continue
+
+        # 2. PRUNE & PUBLISH
+        async with state_lock:
+            # Snapshot keys because we might delete
+            tracked_assets = list(asset_id_que.keys())
+
+            for aid in tracked_assets:
+                # Check if the asset currently in memory is in our fresh list
+                if aid not in valid_clobs:
+                    # DELETE: It was removed from the file
+                    del asset_id_que[aid]
+                    if aid in state:
+                        del state[aid]
+                    # print(f"Pruned dropped asset: {aid}")
+                    continue
+
+                # PUBLISH
+                rb = asset_id_que.get(aid)
+                if rb is None or len(rb) == 0:
+                    continue
+
+                arr = np.array(rb, copy=True)
+                pub.send_multipart([aid.encode(), arr.tobytes()])
 
 async def main():
     await asyncio.gather(
@@ -164,7 +193,6 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        # Use uvloop if available for better performance, else standard
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nStopped.")

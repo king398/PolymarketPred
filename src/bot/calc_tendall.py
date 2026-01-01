@@ -1,6 +1,11 @@
 import zmq
 import numpy as np
 from  tqdm import tqdm
+import  json
+from market_websocket import ASSET_ID_FILE
+from scipy.stats import kendalltau
+from itertools import combinations
+
 tick_dtype = np.dtype([
     ("ts_ms", np.int64),
     ("bid",   np.float32),
@@ -11,25 +16,29 @@ ctx = zmq.Context()
 sub = ctx.socket(zmq.SUB)
 sub.connect("tcp://127.0.0.1:5567")
 
-
+valid_clobs = []
+clob_question_map = {}
+with open(ASSET_ID_FILE, "r") as f:
+    for line in f.readlines():
+        obj = json.loads(line)
+        valid_clobs.append(obj["clob_token_id"])
+        clob_question_map[obj["clob_token_id"]] = obj["question"]
+print(valid_clobs)
 # subscribe to everything
 sub.setsockopt(zmq.SUBSCRIBE, b"")
 assets_ticks = {}
 for _ in tqdm(range(100)):
     aid, payload = sub.recv_multipart()
+    if aid.decode() not in valid_clobs:
+        continue
     arr = np.frombuffer(payload, dtype=tick_dtype)
     mid = (arr["bid"] + arr["ask"]) * 0.5
     if (mid.std() < 1e-3) or (len(arr) < 10):
         continue
     assets_ticks[aid.decode()] = arr
-print("Received ticks for assets:", list(assets_ticks.keys()))
 
 
-import numpy as np
-from scipy.stats import kendalltau
-from itertools import combinations
 
-# extract mid-price series
 mid_prices = {
     aid: (arr["bid"] + arr["ask"]) * 0.5
     for aid, arr in assets_ticks.items()
@@ -58,7 +67,7 @@ top20 = sorted(
 )[:20]
 
 for (a, b), r in top20:
-    print(f"{a} ↔ {b}: τ={r['tau']:.4f}, n={r['n']}")
+    print(f"{clob_question_map[a]} ↔ {clob_question_map[b]}: τ={r['tau']:.4f}, n={r['n']}")
 
 
 
