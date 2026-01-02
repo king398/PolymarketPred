@@ -4,22 +4,17 @@ import numpy as np
 import zmq.asyncio
 import asyncio
 import json
+import sys
 from itertools import combinations
 from scipy.stats import kendalltau
 from market_websocket import ASSET_ID_FILE
-# from pricing import fair_price_np # Assumed to be available locally
 
-# --- Mocking fair_price_np for standalone functionality (Replace with your import) ---
+# --- Mocking fair_price_np (Replace with your actual import) ---
 def fair_price_np(target_series, ref_series, ref_latest_price):
-    """
-    Simple mock of a cointegration/correlation model.
-    Replace this with your actual import from pricing.
-    """
-    # Dummy logic: Assumes simple linear relation for demonstration
     ratio = np.mean(target_series) / np.mean(ref_series)
     fair = ref_latest_price * ratio
     return {'fair_mean': fair}
-# -----------------------------------------------------------------------------------
+# ---------------------------------------------------------------
 
 tick_dtype = np.dtype([
     ("ts_ms", np.int64),
@@ -43,31 +38,39 @@ try:
             valid_clobs.append(obj["clob_token_id"])
             clob_question_map[obj["clob_token_id"]] = obj["question"]
 except FileNotFoundError:
-    print(f"Warning: {ASSET_ID_FILE} not found. Running without name mapping.")
+    pass
 
 assets_ticks = {}
 
 class Position:
     def __init__(self, asset_id, pair_id, entry_price, quantity, side="YES"):
         self.asset_id = asset_id
-        self.pair_id = pair_id  # The asset correlated with this one
+        self.pair_id = pair_id
         self.entry_price = entry_price
         self.quantity = quantity
-        self.side = side # "YES" or "NO"
+        self.side = side
         self.timestamp = time.time()
-
-    def __repr__(self):
-        name = clob_question_map.get(self.asset_id, self.asset_id)
-        return f"<{self.side} {name} @ {self.entry_price:.4f}>"
 
 class SimulatedTrader:
     def __init__(self):
         self.positions = []
-        self.balance = 1000.0  # Starting cash
-        self.trade_size = 10.0 # Dollars per trade
+        self.starting_balance = 1000.0
+        self.balance = self.starting_balance
+        self.trade_size = 10.0
+        self.stop_loss_amt = 0.20
+        self.take_profit_pct = 0.10 # 10% Profit Target
+
+    def log_trade(self, message):
+        # Clear the status line first, print message, then force new line
+        sys.stdout.write(f"\r{message}\n")
+        sys.stdout.flush()
 
     def buy(self, asset_id, pair_id, ask_price, side="YES"):
-        # Prevent duplicate trades on the same pair to avoid spamming
+        # 1. Price Range Filter (0.05 to 0.95)
+        if ask_price <= 0.05 or ask_price >= 0.95:
+            return
+
+        # Prevent duplicate trades
         for p in self.positions:
             if p.asset_id == asset_id and p.pair_id == pair_id:
                 return
@@ -77,49 +80,72 @@ class SimulatedTrader:
             pos = Position(asset_id, pair_id, ask_price, qty, side)
             self.positions.append(pos)
             self.balance -= self.trade_size
-            print(f"OPEN TRADE: Bought {side} [{clob_question_map.get(asset_id, asset_id)}] @ {ask_price:.4f} (Pair: {clob_question_map.get(pair_id, pair_id)})")
+            name = clob_question_map.get(asset_id, asset_id)
+            self.log_trade(f"🟢 BUY: {name} @ {ask_price:.3f}")
 
     def update_positions(self, current_data):
-        """
-        Check exit conditions:
-        1. We are making a profit (Bid > Entry)
-        2. Price is above Fair Price (Reversion achieved)
-        """
-        for pos in self.positions[:]: # Copy list to modify safeley
-            # Ensure we have data for both assets in the pair
+        for pos in self.positions[:]:
             if pos.asset_id not in current_data or pos.pair_id not in current_data:
                 continue
 
-            # Get current market data
             ticks_a = current_data[pos.asset_id]
             ticks_b = current_data[pos.pair_id]
 
             curr_bid = ticks_a['bid'][-1]
-            curr_ask_b = ticks_b['ask'][-1] # Assuming we track B's ask for conservative correlation
+            curr_ask_b = ticks_b['ask'][-1]
 
-            # Re-calculate fair price
-            # Note: Using 'ask' series for correlation history as per original script logic
-            fp_result = fair_price_np(
-                ticks_a['ask'],
-                ticks_b['ask'],
-                curr_ask_b
-            )
+            fp_result = fair_price_np(ticks_a['ask'], ticks_b['ask'], curr_ask_b)
             fair_val = fp_result['fair_mean']
 
-            # EXIT LOGIC
-            # 1. Profit check
-            is_profitable = curr_bid > pos.entry_price
+            # --- EXIT LOGIC ---
 
-            # 2. Fair Value check (Are we "over" the fair price?)
-            # If we bought low, we sell when it goes HIGH (above fair)
+            # 1. STOP LOSS (Immediate Exit: Drop > 0.20)
+            if curr_bid <= (pos.entry_price - self.stop_loss_amt):
+                self._close_position(pos, curr_bid, reason="STOP LOSS 🛑")
+                continue
+
+            # 2. TAKE PROFIT (Immediate Exit: Gain >= 10%)
+            roi = (curr_bid - pos.entry_price) / pos.entry_price
+            if roi >= self.take_profit_pct:
+                self._close_position(pos, curr_bid, reason=f"TAKE PROFIT (+{roi*100:.1f}%) 🚀")
+                continue
+
+            # 3. STRATEGIC EXIT (Profit > 0 AND Reverted to Fair Value)
+            is_profitable = curr_bid > pos.entry_price
             is_over_fair = curr_bid > fair_val
 
             if is_profitable and is_over_fair:
-                revenue = pos.quantity * curr_bid
-                profit = revenue - (pos.quantity * pos.entry_price)
-                self.balance += revenue
-                print(f"CLOSE TRADE: Sold {pos.side} [{clob_question_map.get(pos.asset_id, pos.asset_id)}] @ {curr_bid:.4f}. Profit: ${profit:.2f}")
-                self.positions.remove(pos)
+                self._close_position(pos, curr_bid, reason="FAIR VAL EXIT 💰")
+
+    def _close_position(self, pos, sell_price, reason):
+        revenue = pos.quantity * sell_price
+        profit = revenue - (pos.quantity * pos.entry_price)
+        self.balance += revenue
+        self.positions.remove(pos)
+        name = clob_question_map.get(pos.asset_id, pos.asset_id)
+        self.log_trade(f"🔴 SELL: {name} @ {sell_price:.3f} | {reason} | PnL: ${profit:.2f}")
+
+    def print_status(self, current_data):
+        equity = 0.0
+        for p in self.positions:
+            if p.asset_id in current_data:
+                equity += p.quantity * current_data[p.asset_id]['bid'][-1]
+            else:
+                equity += p.quantity * p.entry_price
+
+        total_value = self.balance + equity
+        total_pnl = total_value - self.starting_balance
+
+        # Single line status bar using carriage return \r
+        status_str = (
+            f"\r[ PnL: ${total_pnl:+.2f} ] "
+            f"[ Cash: ${self.balance:.0f} ] "
+            f"[ Eq: ${equity:.0f} ] "
+            f"[ Pos: {len(self.positions)} ] "
+            f"[ Ticks: {len(assets_ticks)} ]"
+        )
+        sys.stdout.write(status_str)
+        sys.stdout.flush()
 
 trader = SimulatedTrader()
 
@@ -128,95 +154,70 @@ async def collect_ticks():
     while True:
         aid_bytes, payload = await sub.recv_multipart()
         aid = aid_bytes.decode()
-
         arr = np.frombuffer(payload, dtype=tick_dtype)
-
-        # Basic filtering
         if (arr["ask"].std() < 1e-3) or (len(arr) < 100):
             continue
-
         assets_ticks[aid] = arr
 
 def run_strategy(assets_snapshot: dict[str, np.ndarray]):
-    # 1. Update existing positions (Check for Exits)
+    # 1. Manage Positions (Exits)
     trader.update_positions(assets_snapshot)
 
-    # 2. Scan for New Entries
-    mid_prices = {
-        aid: arr['ask'] # Using Ask as 'mid' proxy per original logic
-        for aid, arr in assets_snapshot.items()
-    }
+    # 2. Print Status Bar (Flushed)
+    trader.print_status(assets_snapshot)
 
+    # 3. Scan for New Entries
+    mid_prices = {aid: arr['ask'] for aid, arr in assets_snapshot.items()}
     results = {}
+
     for (aid1, s1), (aid2, s2) in combinations(mid_prices.items(), 2):
         n = min(len(s1), len(s2))
-        if n < 20: # Minimum data points
-            continue
+        if n < 20: continue
+
+        # Quick pre-filter to save CPU
+        if np.abs(s1[-1] - s2[-1]) > 0.9: continue
 
         tau, pval = kendalltau(s1[:n], s2[:n])
+        if abs(tau) > 0.6:
+            results[(aid1, aid2)] = {"tau": tau}
 
-        # Only look at strong correlations
-        if abs(tau) > 0.5:
-            results[(aid1, aid2)] = {
-                "tau": tau,
-                "n": n,
-            }
-
-    # Sort by strength of correlation
-    top_opps = sorted(results.items(), key=lambda x: abs(x[1]["tau"]), reverse=True)[:20]
+    top_opps = sorted(results.items(), key=lambda x: abs(x[1]["tau"]), reverse=True)[:15]
 
     for (a, b), r in top_opps:
         price_a = mid_prices[a][-1]
         price_b = mid_prices[b][-1]
 
-        fair_res_a = fair_price_np(mid_prices[a], mid_prices[b], price_b)
-        fair_res_b = fair_price_np(mid_prices[b], mid_prices[a], price_a)
+        fair_a = fair_price_np(mid_prices[a], mid_prices[b], price_b)['fair_mean']
+        fair_b = fair_price_np(mid_prices[b], mid_prices[a], price_a)['fair_mean']
 
-        fair_a = fair_res_a['fair_mean']
-        fair_b = fair_res_b['fair_mean']
-
-        mispricing_a = fair_a - price_a # Positive = Undervalued (Buy)
+        mispricing_a = fair_a - price_a
         mispricing_b = fair_b - price_b
 
-        # Threshold
         THRESHOLD = 0.05
 
-        # Check Asset A
-        if abs(mispricing_a) > THRESHOLD:
-            # If Mispricing > 0, Fair > Actual. We want to BUY.
-            if mispricing_a > 0:
-                actual_ask_a = assets_snapshot[a]['ask'][-1]
-                # Check if we still have room (Fair Price > Current Ask)
-                if fair_a > actual_ask_a:
-                    trader.buy(a, b, actual_ask_a, side="YES")
+        if mispricing_a > THRESHOLD:
+            actual_ask_a = assets_snapshot[a]['ask'][-1]
+            if fair_a > actual_ask_a:
+                trader.buy(a, b, actual_ask_a, side="YES")
 
-            # If Mispricing < 0, Actual > Fair. We want to SELL (or Buy NO).
-            # Assuming we can buy "NO" or just ignore if we don't hold it.
-            # Implementation for "NO" would go here if token ID known.
-
-        # Check Asset B
-        if abs(mispricing_b) > THRESHOLD:
-            if mispricing_b > 0:
-                actual_ask_b = assets_snapshot[b]['ask'][-1]
-                if fair_b > actual_ask_b:
-                    trader.buy(b, a, actual_ask_b, side="YES")
+        if mispricing_b > THRESHOLD:
+            actual_ask_b = assets_snapshot[b]['ask'][-1]
+            if fair_b > actual_ask_b:
+                trader.buy(b, a, actual_ask_b, side="YES")
 
 async def periodic_logic():
+    print("Strategy Engine Started... Waiting for data.")
     while True:
         await asyncio.sleep(1)
-        if len(assets_ticks) < 2:
-            continue
-
+        if len(assets_ticks) < 2: continue
         snapshot = {k: v.copy() for k, v in assets_ticks.items()}
-        # Run CPU-bound math in thread to avoid blocking asyncio loop
         await asyncio.to_thread(run_strategy, snapshot)
 
 async def main():
-    print("Starting strategy engine...")
     await asyncio.gather(collect_ticks(), periodic_logic())
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Shutting down...")
+        print("\nShutting down...")
