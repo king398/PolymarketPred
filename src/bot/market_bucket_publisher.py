@@ -10,8 +10,8 @@ from market_websocket import ASSET_ID_FILE
 HOST = "127.0.0.1"
 PORT = 9000
 
-BUCKET_MS = 500
-BUCKET_SIZE = 8192
+BUCKET_MS = 250
+BUCKET_SIZE = 512
 BROADCAST_INTERVAL_S = 1.0
 
 # --- Filter Config ---
