@@ -10,11 +10,19 @@ OUTPUT_FILE = "/home/mithil/PycharmProjects/PolymarketPred/data/clob_token_ids.j
 BASE_URL = "https://gamma-api.polymarket.com/events/slug/{slug}"
 
 # Symbols
-SYMBOLS_SHORT = ["btc", "eth", "sol", "xrp"]
-SYMBOLS_LONG = ["bitcoin", "ethereum", "solana", "xrp"]
+SYMBOLS_SHORT = ["btc", "eth", "xrp", "sol"]
+SYMBOLS_LONG = ["bitcoin", "ethereum", "xrp", "solana"]
 
 ET = pytz.timezone("US/Eastern")
 
+# Mapping categories to timedeltas for date math
+DURATION_MAP = {
+    "15m": timedelta(minutes=15),
+    "1h": timedelta(hours=1),
+    "4h": timedelta(hours=4),
+    "1d": timedelta(days=1),
+    "weekly": timedelta(days=7)
+}
 
 def get_current_et():
     return datetime.now(ET)
@@ -38,8 +46,9 @@ def generate_buckets(interval, count):
         delta = timedelta(hours=1)
         fmt_func = lambda dt: f"{dt.strftime('%B').lower()}-{dt.day}-{dt.strftime('%I%p').lstrip('0').lower()}"
     elif interval == "1d":
-        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        delta = timedelta(days=1)
+        # Usually checking current or previous day depending on your logic
+        start = now.replace(hour=12, minute=0, second=0, microsecond=0)
+        delta = timedelta(days=-1)
         fmt_func = lambda dt: f"{dt.strftime('%B').lower()}-{dt.day}"
     else:
         return []
@@ -84,7 +93,16 @@ async def process_standard_markets(session, category, symbols, interval, count, 
     for symbol in symbols:
         for i, (url_param, ts) in enumerate(buckets):
             slug = pattern.format(symbol=symbol, param=url_param)
-            tasks.append((slug, i, str(ts), symbol))
+
+            # --- LOGIC FIX ---
+            # For 1d markets, the slug date (e.g. Jan 3) is the Resolution date.
+            # The market START date is 1 day prior (e.g. Jan 2).
+            if category == "1d":
+                market_start = ts - timedelta(days=1)
+            else:
+                market_start = ts
+
+            tasks.append((slug, i, market_start, symbol))
 
     results = []
     # Fetch all concurrently
@@ -92,17 +110,24 @@ async def process_standard_markets(session, category, symbols, interval, count, 
     responses = await asyncio.gather(*fetch_tasks)
 
     for (slug, pos, ts, sym), data in zip(tasks, responses):
+
         if not data or "markets" not in data:
             continue
         try:
             # Standard: Take the first market (usually the main one)
             market = data["markets"][0]
+
+            # Calculate Market End
+            duration = DURATION_MAP.get(category, timedelta(0))
+            market_end = ts + duration
+
             results.append({
                 "slug": slug,
                 "clob_token_id": parse_token_id(market),
                 "market_position": pos,
                 "category": category,
-                "primary_market_timestamp": ts,
+                "primary_market_timestamp": str(ts), # Start Time
+                "market_end": str(market_end),       # End Time
                 "question": market["question"]
             })
         except Exception:
@@ -121,7 +146,8 @@ async def process_weekly_markets(session, count):
     for symbol in SYMBOLS_LONG:
         for i, (url_param, ts) in enumerate(buckets):
             slug = pattern.format(symbol=symbol, param=url_param)
-            tasks.append((slug, i, str(ts)))
+            # Pass 'ts' as datetime object
+            tasks.append((slug, i, ts))
 
     results = []
     fetch_tasks = [fetch_slug(session, t[0]) for t in tasks]
@@ -133,22 +159,23 @@ async def process_weekly_markets(session, count):
 
         for market in data["markets"]:
             try:
-                # 1. Price Filter (Skip if max price < 0.95)
-                # This filters out strikes that are already decided or very unlikely
+                # 1. Price Filter
                 prices = parse_prices(market)
-                if not prices or max([float(x) for x in prices]) < 0.01:  # Adjusted logic or keep your 0.95
-                    # Note: Your original logic was 'filter out if max > 0.95'?
-                    # Usually for data collection you want active markets.
-                    # I'll keep your original intent: include valid markets.
+                if not prices or max([float(x) for x in prices]) < 0.01:
                     pass
 
-                    # 2. Add Valid Market
+                # Calculate Market End
+                category = "weekly"
+                duration = DURATION_MAP.get(category, timedelta(days=7))
+                market_end = ts + duration
+
                 results.append({
                     "slug": slug,
                     "clob_token_id": parse_token_id(market),
                     "market_position": pos,
-                    "category": "weekly",
-                    "primary_market_timestamp": ts,
+                    "category": category,
+                    "primary_market_timestamp": str(ts),
+                    "market_end": str(market_end),
                     "question": market["question"]
                 })
             except Exception:
@@ -185,13 +212,14 @@ async def main():
 
                 # 4. 1 Day
                 # print("Fetching 1d...")
+                # Note: '1d' category will now automatically shift start_time back by 1 day
                 all_data.extend(await process_standard_markets(
                     session, "1d", SYMBOLS_LONG, "1d", 1, "{symbol}-up-or-down-on-{param}"
                 ))
 
                 # 5. Weekly
                 # print("Fetching Weekly...")
-                all_data.extend(await process_weekly_markets(session, 3))
+                #all_data.extend(await process_weekly_markets(session, 3))
 
                 # Write to file
                 if all_data:

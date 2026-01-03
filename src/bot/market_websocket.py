@@ -96,56 +96,40 @@ async def tcp_server(b: Broadcaster) -> None:
 
 # --- BINANCE STREAMER (BTC/ETH) ---
 async def stream_binance(b: Broadcaster) -> None:
-    """Streams BTC and ETH Book Tickers from Binance Futures."""
-    print("[Binance] Connecting to stream for BTC & ETH...")
-
-    # Subscribe payload for best bid/ask (bookTicker is fastest)
-    subscribe_msg = {
-        "method": "SUBSCRIBE",
-        "params": [
-            "btcusdt@bookTicker",
-            "ethusdt@bookTicker"
-        ],
-        "id": 1
-    }
+    """Streams BTC and ETH Book Tickers from Binance Spot."""
+    # Spot combined stream URL format: /stream?streams=btcusdt@bookTicker/ethusdt@bookTicker
+    spot_url = "wss://stream.binance.com:9443/stream?streams=btcusdt@bookTicker/ethusdt@bookTicker"
 
     while True:
         try:
-            async with websockets.connect(BINANCE_WS_URL, ping_interval=20) as ws:
-                await ws.send(json.dumps(subscribe_msg))
-                print("[Binance] Subscribed to BTCUSDT and ETHUSDT.")
+            async with websockets.connect(spot_url, ping_interval=20) as ws:
+                print("[Binance Spot] Subscribed to BTC/ETH.")
 
                 async for msg in ws:
                     try:
-                        data = json_lib.loads(msg)
+                        raw_data = json_lib.loads(msg)
+                        # Combined streams wrap data in a "data" key
+                        data = raw_data.get("data")
 
-                        # Handle bookTicker event
-                        # Binance format: e: event, u: updateId, s: symbol, b: best_bid, a: best_ask, T: trans_time
-                        if data.get("e") == "bookTicker":
-                            symbol = data["s"]
-                            # Clean asset_id: "BTCUSDT" -> "BTC"
-                            asset_id = symbol.replace("USDT", "")
+                        symbol = data["s"] # e.g., "BTCUSDT"
+                        asset_id = symbol.replace("USDT", "")
 
-                            out = {
-                                "ts_ms": data["T"], # Transaction time
-                                "asset_id": asset_id,
-                                "bid": float(data["b"]),
-                                "ask": float(data["a"])
-                            }
+                        out = {
+                            "ts_ms": int(time.time() * 1000), # Spot ticker doesn't always have 'T'
+                            "asset_id": asset_id,
+                            "bid": float(data["b"]),
+                            "ask": float(data["a"])
+                        }
 
-                            line = (json_lib.dumps(out)) + b"\n"
-                            b.broadcast_line(line)
+                        line = json_lib.dumps(out) + b"\n"
+                        b.broadcast_line(line)
 
-                    except Exception:
+                    except Exception as e:
                         continue
 
-        except asyncio.CancelledError:
-            print("[Binance] Stream cancelled.")
-            raise
         except Exception as e:
-            print(f"[Binance] Connection Error: {e}. Reconnecting in 2s...")
+            print(f"[Binance Spot] Error: {e}. Reconnecting...")
             await asyncio.sleep(2)
-
 # --- POLYMARKET STREAMER ---
 async def stream_polymarket(b: Broadcaster, asset_ids: List[str]) -> None:
     """Streams data for specific IDs. Raises CancelledError if task is cancelled."""

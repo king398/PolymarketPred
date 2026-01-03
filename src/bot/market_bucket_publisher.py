@@ -10,7 +10,7 @@ from market_websocket import ASSET_ID_FILE
 HOST = "127.0.0.1"
 PORT = 9000
 
-BUCKET_MS = 200
+BUCKET_MS = 50
 BUCKET_SIZE = 600
 BROADCAST_INTERVAL_S = BUCKET_MS / 1000
 
@@ -31,6 +31,7 @@ state_lock = asyncio.Lock()
 
 # Global whitelist (updated dynamically by the publisher loop)
 valid_clobs = set()
+# add BTC and ETH for testing
 
 ZMQ_PUB = "tcp://127.0.0.1:5567"
 ctx = zmq.Context.instance()
@@ -68,18 +69,20 @@ async def process_market_data():
                 # creating NEW buffers for assets that were just removed.
                 if valid_clobs and aid not in valid_clobs:
                     continue
-
                 raw_bid = msg.get("bid")
                 raw_ask = msg.get("ask")
 
                 if raw_bid is None or raw_ask is None:
                     continue
-
+                if aid != "BTC" and aid != "ETH":
+                    if not (MIN_VALID_PRICE <= float(raw_bid) <= MAX_VALID_PRICE):
+                        continue
+                    if not (MIN_VALID_PRICE <= float(raw_ask) <= MAX_VALID_PRICE):
+                        continue
                 bid = float(raw_bid)
                 ask = float(raw_ask)
 
-                if bid <= MIN_VALID_PRICE or ask >= MAX_VALID_PRICE:
-                    continue
+
 
                 if bid > ask:
                     continue
@@ -142,6 +145,8 @@ async def publish_all_assets_every_1s():
 
         # 1. READ FILE (Refresh Whitelist)
         current_valid_ids = set()
+        current_valid_ids.update({"BTC", "ETH"})
+
         try:
             with open(ASSET_ID_FILE, "r") as f:
                 for line in f:
