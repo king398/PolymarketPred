@@ -76,3 +76,41 @@ def fair_price_np(A: np.ndarray, B: np.ndarray, pB_new: float) -> dict:
         "fair_mean": fair,
         "n_obs": int(A.size),
     }
+def fair_price_copula(A: np.ndarray, B: np.ndarray, pB_latest: float) -> dict:
+    """
+    Improved Gaussian Copula for Pair Trading.
+    Estimates the 'fair' price of A based on the current price of B.
+    """
+    # 1. Alignment and Cleaning
+    n = min(len(A), len(B))
+    if n < 10: return {"fair_mean": A[-1] if len(A) > 0 else 0.5, "tau": 0}
+
+    a_vec = A[-n:]
+    b_vec = B[-n:]
+
+    # 2. Kendall's Tau -> Rho (Gaussian Param)
+    # Using a fast approximation for Kendall Tau if performance is an issue
+    tau, _ = kendalltau(a_vec, b_vec)
+    if np.isnan(tau): tau = 0
+    rho = np.sin(np.pi * tau / 2.0)
+    rho = np.clip(rho, -0.99, 0.99)
+
+    # 3. Probability Integral Transform (PIT)
+    # Where does the current price of B sit relative to its history?
+    # We use a small epsilon to avoid +/- infinity in norm.ppf
+    v_b = np.mean(b_vec <= pB_latest)
+    v_b = np.clip(v_b, 0.001, 0.999)
+
+    # 4. Conditional Expectation in Gaussian Space
+    # E[U_a | U_b = v_b] = Phi(rho * Phi^-1(v_b))
+    z_b = norm.ppf(v_b)
+    u_a_cond = norm.cdf(rho * z_b)
+
+    # 5. Inverse CDF (Quantile) to get price
+    fair_a = np.quantile(a_vec, u_a_cond)
+
+    return {
+        "fair_mean": float(fair_a),
+        "tau": float(tau),
+        "rho": float(rho)
+    }

@@ -10,9 +10,9 @@ from market_websocket import ASSET_ID_FILE
 HOST = "127.0.0.1"
 PORT = 9000
 
-BUCKET_MS = 250
-BUCKET_SIZE = 512
-BROADCAST_INTERVAL_S = 1.0
+BUCKET_MS = 200
+BUCKET_SIZE = 600
+BROADCAST_INTERVAL_S = BUCKET_MS / 1000
 
 # --- Filter Config ---
 MIN_VALID_PRICE = 0.00
@@ -20,8 +20,8 @@ MAX_VALID_PRICE = 0.99
 
 tick_dtype = np.dtype([
     ("ts_ms", np.int64),
-    ("bid",   np.float32),
-    ("ask",   np.float32),
+    ("bid", np.float32),
+    ("ask", np.float32),
 ])
 
 # Shared buffers + state
@@ -37,9 +37,11 @@ ctx = zmq.Context.instance()
 pub = ctx.socket(zmq.PUB)
 pub.bind(ZMQ_PUB)
 
+
 def emit(bucket_start_ms: int, aid: str, bid: float, ask: float):
     if aid in asset_id_que:
         asset_id_que[aid].append((int(bucket_start_ms), float(bid), float(ask)))
+
 
 async def process_market_data():
     """Ingests raw TCP data, filters it, and updates state."""
@@ -111,6 +113,7 @@ async def process_market_data():
         writer.close()
         await writer.wait_closed()
 
+
 async def bucket_timer():
     """Periodically forward-fills the price buckets."""
     sleep_s = BUCKET_MS / 1000.0
@@ -124,6 +127,7 @@ async def bucket_timer():
                     emit(st["next_boundary"], aid, st["last_bid"], st["last_ask"])
                     st["next_boundary"] += BUCKET_MS
         await asyncio.sleep(sleep_s)
+
 
 async def publish_all_assets_every_1s():
     """
@@ -184,12 +188,14 @@ async def publish_all_assets_every_1s():
                 arr = np.array(rb, copy=True)
                 pub.send_multipart([aid.encode(), arr.tobytes()])
 
+
 async def main():
     await asyncio.gather(
         process_market_data(),
         bucket_timer(),
         publish_all_assets_every_1s(),
     )
+
 
 if __name__ == "__main__":
     try:

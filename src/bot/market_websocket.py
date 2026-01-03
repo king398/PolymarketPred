@@ -3,22 +3,28 @@ import websockets
 import time
 import re
 from typing import Any, Dict, List, Set
-import uvloop
 import orjson
 import json
+
+# Try to use uvloop for performance
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except ImportError:
+    pass
 
 json_lib = orjson
 
 # --- CONFIG ---
 POLY_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+BINANCE_WS_URL = "wss://fstream.binance.com/ws"  # USDS-M Futures
 ASSET_ID_FILE = "/home/mithil/PycharmProjects/PolymarketPred/data/clob_token_ids.jsonl"
 BIND_HOST = "127.0.0.1"
 BIND_PORT = 9000
-FILE_CHECK_INTERVAL = 60  # How often to check the file for changes (seconds)
+FILE_CHECK_INTERVAL = 60
 
 # --- UTILS ---
 _LEADING_NUM_PREFIX = re.compile(r"^\s*\d+")
-
 
 def _decode_events(raw: str) -> List[Dict[str, Any]]:
     s = raw.strip()
@@ -31,7 +37,6 @@ def _decode_events(raw: str) -> List[Dict[str, Any]]:
     if isinstance(obj, dict): return [obj]
     if isinstance(obj, list): return [x for x in obj if isinstance(x, dict)]
     return []
-
 
 def load_asset_ids():
     """Reads the JSONL file and returns a sorted list of unique IDs."""
@@ -48,7 +53,6 @@ def load_asset_ids():
     except FileNotFoundError:
         print(f"[System] Warning: {ASSET_ID_FILE} not found.")
         return []
-
 
 # --- BROADCASTER & SERVER ---
 class Broadcaster:
@@ -75,7 +79,6 @@ class Broadcaster:
                 dead.append(w)
         for w in dead: self.remove(w)
 
-
 async def tcp_server(b: Broadcaster) -> None:
     async def handle_client(reader, writer):
         b.add(writer)
@@ -91,11 +94,66 @@ async def tcp_server(b: Broadcaster) -> None:
     async with server:
         await server.serve_forever()
 
+# --- BINANCE STREAMER (BTC/ETH) ---
+async def stream_binance(b: Broadcaster) -> None:
+    """Streams BTC and ETH Book Tickers from Binance Futures."""
+    print("[Binance] Connecting to stream for BTC & ETH...")
+
+    # Subscribe payload for best bid/ask (bookTicker is fastest)
+    subscribe_msg = {
+        "method": "SUBSCRIBE",
+        "params": [
+            "btcusdt@bookTicker",
+            "ethusdt@bookTicker"
+        ],
+        "id": 1
+    }
+
+    while True:
+        try:
+            async with websockets.connect(BINANCE_WS_URL, ping_interval=20) as ws:
+                await ws.send(json.dumps(subscribe_msg))
+                print("[Binance] Subscribed to BTCUSDT and ETHUSDT.")
+
+                async for msg in ws:
+                    try:
+                        data = json_lib.loads(msg)
+
+                        # Handle bookTicker event
+                        # Binance format: e: event, u: updateId, s: symbol, b: best_bid, a: best_ask, T: trans_time
+                        if data.get("e") == "bookTicker":
+                            symbol = data["s"]
+                            # Clean asset_id: "BTCUSDT" -> "BTC"
+                            asset_id = symbol.replace("USDT", "")
+
+                            out = {
+                                "ts_ms": data["T"], # Transaction time
+                                "asset_id": asset_id,
+                                "bid": float(data["b"]),
+                                "ask": float(data["a"])
+                            }
+
+                            line = (json_lib.dumps(out)) + b"\n"
+                            b.broadcast_line(line)
+
+                    except Exception:
+                        continue
+
+        except asyncio.CancelledError:
+            print("[Binance] Stream cancelled.")
+            raise
+        except Exception as e:
+            print(f"[Binance] Connection Error: {e}. Reconnecting in 2s...")
+            await asyncio.sleep(2)
 
 # --- POLYMARKET STREAMER ---
 async def stream_polymarket(b: Broadcaster, asset_ids: List[str]) -> None:
     """Streams data for specific IDs. Raises CancelledError if task is cancelled."""
-    print(f"[WS] Starting stream for {len(asset_ids)} assets...")
+    if not asset_ids:
+        print("[Poly] No assets to stream.")
+        return
+
+    print(f"[Poly] Starting stream for {len(asset_ids)} assets...")
     market_state = {aid: (None, None) for aid in asset_ids}
 
     while True:
@@ -103,7 +161,7 @@ async def stream_polymarket(b: Broadcaster, asset_ids: List[str]) -> None:
             async with websockets.connect(POLY_WS_URL, ping_interval=20, max_size=None) as ws:
                 # Subscribe
                 sub_msg = {"type": "market", "assets_ids": asset_ids}
-                await ws.send(json.dumps(sub_msg) if json_lib == json else json_lib.dumps(sub_msg).decode())
+                await ws.send(json_lib.dumps(sub_msg).decode())
 
                 async for msg in ws:
                     events = _decode_events(msg)
@@ -145,56 +203,54 @@ async def stream_polymarket(b: Broadcaster, asset_ids: List[str]) -> None:
                                 "ask": curr_ask
                             }
 
-                            line = (json_lib.dumps(out) if json_lib != json else json.dumps(out).encode(
-                                'utf-8')) + b"\n"
+                            line = (json_lib.dumps(out)) + b"\n"
                             b.broadcast_line(line)
 
         except asyncio.CancelledError:
-            print("[WS] Stream cancelled (reloading IDs).")
+            print("[Poly] Stream cancelled (reloading IDs).")
             raise
         except Exception as e:
-            print(f"[WS] Error: {e}. Reconnecting in 2s...")
+            print(f"[Poly] Error: {e}. Reconnecting in 2s...")
             await asyncio.sleep(2)
-
 
 # --- MAIN MANAGER ---
 async def main():
     b = Broadcaster()
+
+    # 1. Start TCP Server
     asyncio.create_task(tcp_server(b))
 
-    current_ids = []
-    ws_task = None
+    # 2. Start Binance Stream (Permanent Background Task)
+    asyncio.create_task(stream_binance(b))
 
+    current_ids = []
+    poly_task = None
+
+    # 3. Manage Polymarket Stream (Dynamic Reloading)
     while True:
-        # 1. Check file for new IDs
+        # Check file for new IDs
         new_ids = await asyncio.to_thread(load_asset_ids)
 
-        # 2. Compare with current running IDs
+        # Compare with current running IDs
         if new_ids and (new_ids != current_ids):
             if current_ids:
-                print(f"[System] ID Change Detected! Old: {len(current_ids)}, New: {len(new_ids)}")
+                print(f"[System] Poly ID Change! Old: {len(current_ids)}, New: {len(new_ids)}")
             else:
-                print(f"[System] Initial Load: {len(new_ids)} IDs found.")
+                print(f"[System] Poly Initial Load: {len(new_ids)} IDs found.")
 
-            # 3. Restart WebSocket Task
-            if ws_task:
-                ws_task.cancel()
+            # Restart Polymarket Task
+            if poly_task:
+                poly_task.cancel()
                 try:
-                    await ws_task
+                    await poly_task
                 except asyncio.CancelledError:
                     pass
 
             current_ids = new_ids
-            ws_task = asyncio.create_task(stream_polymarket(b, current_ids))
+            poly_task = asyncio.create_task(stream_polymarket(b, current_ids))
 
-        # 4. Sleep before checking file again
+        # Sleep before checking file again
         await asyncio.sleep(FILE_CHECK_INTERVAL)
 
-
 if __name__ == "__main__":
-    try:
-
-        uvloop.install()
-    except ImportError:
-        pass
     asyncio.run(main())

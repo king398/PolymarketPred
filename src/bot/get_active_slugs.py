@@ -191,7 +191,7 @@ async def main():
 
                 # 5. Weekly
                 # print("Fetching Weekly...")
-                #all_data.extend(await process_weekly_markets(session, 3))
+                all_data.extend(await process_weekly_markets(session, 3))
 
                 # Write to file
                 if all_data:
