@@ -5,6 +5,7 @@ import ast
 import pytz
 from datetime import datetime, timedelta
 import os
+
 # --- CONFIG ---
 DATA_DIR = "/home/mithil/PycharmProjects/PolymarketPred/data"
 OUTPUT_FILE = os.path.join(DATA_DIR, "clob_token_ids.jsonl")
@@ -25,8 +26,10 @@ DURATION_MAP = {
     "weekly": timedelta(days=7)
 }
 
+
 def get_current_et():
     return datetime.now(ET)
+
 
 def generate_buckets(interval, count):
     """Generates time strings for URL slugs."""
@@ -90,6 +93,56 @@ def parse_tokens(market):
     return None, None
 
 
+def parse_prices(market):
+    raw = market.get("outcomePrices")
+    if isinstance(raw, str):
+        return ast.literal_eval(raw)
+    raw = [float(p) for p in raw]
+    return raw
+
+
+async def process_weekly_markets(session, count):
+    """
+    Weekly logic: Fetch event -> Iterate ALL markets -> Filter by price > 0.95
+    """
+    tasks = []
+    buckets = generate_buckets("1d", count)  # Weekly uses "december-31" format
+    pattern = "{symbol}-above-on-{param}"  # e.g. bitcoin-above-on-december-31
+
+    for symbol in SYMBOLS_LONG:
+        for i, (url_param, ts) in enumerate(buckets):
+            slug = pattern.format(symbol=symbol, param=url_param)
+            tasks.append((slug, i, str(ts)))
+
+    results = []
+    fetch_tasks = [fetch_slug(session, t[0]) for t in tasks]
+    responses = await asyncio.gather(*fetch_tasks)
+
+    for (slug, pos, ts), data in zip(tasks, responses):
+        if not data or "markets" not in data:
+            continue
+
+        for market in data["markets"]:
+            try:
+
+                prices = parse_prices(market)
+                prices = [float(p) for p in prices if p is not None]
+
+                if max(prices) > 0.95 or min(prices) < 0.05:
+                    continue
+                results.append({
+                    "slug": market['slug'],
+                    "clob_token_id": parse_tokens(market),
+                    "market_position": pos,
+                    "category": "weekly",
+                    "primary_market_timestamp": ts,
+                    "question": market["question"]
+                })
+            except Exception:
+                continue
+    return results
+
+
 async def process_standard_markets(session, category, symbols, interval, count, pattern):
     tasks = []
     buckets = generate_buckets(interval, count)
@@ -149,7 +202,7 @@ async def main():
 
                 # 1. 15 Minute
                 # print("Fetching 15m...")
-                #all_data.extend(await process_standard_markets(
+                # all_data.extend(await process_standard_markets(
                 #    session, "15m", SYMBOLS_SHORT, "15m", 2, "{symbol}-updown-15m-{param}"))
 
                 # 2. 1 Hour
@@ -169,7 +222,8 @@ async def main():
                 all_data.extend(await process_standard_markets(
                     session, "1d", SYMBOLS_LONG, "1d", 2, "{symbol}-up-or-down-on-{param}"
                 ))
-
+                print(f"Fetching 1w (Weekly)...")
+                all_data.extend(await process_weekly_markets(session, 9))
                 if all_data:
                     with open(OUTPUT_FILE, "w") as f:
                         for row in all_data:
@@ -179,7 +233,8 @@ async def main():
                     # Debug print to verify correct Daily market capture
                     daily_markets = [m for m in all_data if m['category'] == '1d']
                     if daily_markets:
-                        print(f"   > Captured Daily: {daily_markets[0]['question']} (End: {daily_markets[0]['market_end']})")
+                        print(
+                            f"   > Captured Daily: {daily_markets[0]['question']} (End: {daily_markets[0]['market_end']})")
                 else:
                     print("[System] Warning: No data fetched this cycle.")
 
