@@ -1,9 +1,9 @@
 """
 BATES-MODEL VALUE ARBITRAGE SIM (Polymarket Up/Down)
+- DETAILED LOGS: Full trade lifecycle (Entry/Exit px, Qty, Duration).
+- FULL TEXT: Questions wrap instead of truncate.
+- AUTO-CLEAN: Expired markets are hidden from the scanner.
 - UNIFIED UI: Single table for scanner & portfolio.
-- AUTO-SETTLEMENT: Resolves expired markets to 0 or 1.
-- AUTO-LIQUIDATION: Closes positions when <10% time remains.
-- STABLE UI: Sorts by Question alphabetically to prevent shifting.
 """
 
 import time
@@ -43,10 +43,10 @@ PARAMS_FILE = os.path.join(DATA_DIR, "bates_params_digital.jsonl")
 STRIKES_FILE = os.path.join(DATA_DIR,"market_1m_candle_opens.jsonl")
 
 # Strategy Parameters
-MIN_EDGE = 0.02
+MIN_EDGE = 0.03
 MAX_POS_SIZE = 50.0
 SLIPPAGE = 0.0002
-LIQUIDATION_THRESH = 0.10  # 10% time remaining
+LIQUIDATION_THRESH = 0.05  # 10% time remaining
 
 # Execution Parameters
 CHUNK_PCT = 0.5
@@ -157,6 +157,8 @@ class Position:
         self.size_qty = 0.0
         self.cost_basis = 0.0
 
+        # Tracking for logs
+        self.start_ts = time.time()
         self.target_cost = MAX_POS_SIZE
         self.last_fill_ts = 0
         self.is_accumulating = True
@@ -167,7 +169,7 @@ class SimulatedTrader:
         self.balance = 1000.0
         self.positions = []
         self.realized_pnl = 0.0
-        self.logs = deque(maxlen=8)
+        self.logs = deque(maxlen=10)
 
     def log(self, msg, style="white"):
         ts = time.strftime("%H:%M:%S")
@@ -178,8 +180,13 @@ class SimulatedTrader:
             if p.asset_id == aid: return p
         return None
 
-    def _settle_position(self, pos, final_price_yes):
-        """Resolves a position at expiration based on final market price."""
+    def _format_duration(self, start_ts):
+        diff = time.time() - start_ts
+        if diff < 60: return f"{int(diff)}s"
+        return f"{int(diff/60)}m"
+
+    def _settle_position(self, pos, final_price_yes, q_text):
+        """Resolves a position at expiration."""
         outcome = 1.0 if final_price_yes >= 0.50 else 0.0
         payout_val = outcome if pos.side == "YES" else (1.0 - outcome)
         total_payout = pos.size_qty * payout_val
@@ -189,7 +196,14 @@ class SimulatedTrader:
         self.realized_pnl += pnl
 
         color = "green" if pnl >= 0 else "red"
-        self.log(f"SETTLE {pos.side} @ {final_price_yes:.2f} -> {outcome} | PnL: ${pnl:.2f}", style=f"bold {color}")
+        dur = self._format_duration(pos.start_ts)
+
+        log_msg = (
+            f"SETTLED {pos.side} | {q_text}\n"
+            f"   >> Exit: {outcome:.0f} | Entry: {pos.avg_entry_px:.3f} | Qty: {pos.size_qty:.1f}\n"
+            f"   >> Held: {dur} | PnL: ${pnl:.2f}"
+        )
+        self.log(log_msg, style=f"bold {color}")
         self.positions.remove(pos)
 
     def evaluate(self, aid, market_bid, market_ask):
@@ -205,16 +219,13 @@ class SimulatedTrader:
         if rem_ms <= 0:
             if pos:
                 mid = (market_bid + market_ask) / 2.0
-                self._settle_position(pos, mid)
+                self._settle_position(pos, mid, meta['question'])
             return
 
         # 2. Check Auto-Liquidation (Time < 10%)
-        # Calculate ratio of remaining time to initial market duration
         time_ratio = rem_ms / meta['initial_duration_ms']
-
         if pos and time_ratio < LIQUIDATION_THRESH:
-            # Force Close Logic
-            self._check_exit(pos, -1, market_bid, market_ask, force=True)
+            self._check_exit(pos, -1, market_bid, market_ask, meta['question'], force=True)
             return
 
         underlying = meta['underlying']
@@ -226,28 +237,30 @@ class SimulatedTrader:
         model_p = BatesModel.price_binary_call(spot, strike, T_years, meta['initial_T'], params)
 
         yes_edge = model_p - market_ask
-        no_edge = market_bid - model_p
+        # no_edge calculation is removed/ignored for entry logic below
 
         # Position Management
         if pos:
             if pos.is_accumulating:
                 if (time.time() - pos.last_fill_ts) >= CHUNK_DELAY:
-                    valid = (pos.side == "YES" and yes_edge > MIN_EDGE) or \
-                            (pos.side == "NO" and no_edge > MIN_EDGE)
-                    price = market_ask if pos.side == "YES" else (1.0 - market_bid)
+                    # Only check YES edge for validity since we only trade YES
+                    valid = (pos.side == "YES" and yes_edge > MIN_EDGE)
+                    price = market_ask
+
                     if valid: self._execute_chunk(pos, price, meta['question'])
                     else: pos.is_accumulating = False
             else:
-                self._check_exit(pos, model_p, market_bid, market_ask)
+                self._check_exit(pos, model_p, market_bid, market_ask, meta['question'])
         else:
             # Entry logic (Don't enter if < 10% time left)
             if time_ratio > LIQUIDATION_THRESH:
                 q_text = meta['question']
+
+                # --- MODIFIED: ONLY ENTER YES POSITIONS ---
                 if yes_edge > MIN_EDGE:
                     self._start_position(aid, "YES", market_ask, model_p, strike, q_text)
-                elif no_edge > MIN_EDGE:
-                    no_px = 1.0 - market_bid
-                    self._start_position(aid, "NO", no_px, model_p, strike, q_text)
+
+                # The logic for NO positions has been removed here.
 
     def _start_position(self, aid, side, price, model_p, strike, q_text):
         if price <= 0.05 or price >= 0.95: return
@@ -269,15 +282,16 @@ class SimulatedTrader:
         pos.avg_entry_px = pos.cost_basis / pos.size_qty
         pos.last_fill_ts = time.time()
 
-        color = "green" if pos.side == "YES" else "red"
-        self.log(f"BUY {pos.side} | {q_text[:15]}...", style=f"dim {color}")
+        color = "green" # Since only YES is traded, color is always green
+        msg = f"BUY {pos.side} | {q_text} @ {price:.3f} (Qty: {qty:.1f})"
+        self.log(msg, style=f"dim {color}")
+
         if pos.cost_basis >= pos.target_cost * 0.99:
             pos.is_accumulating = False
 
-    def _check_exit(self, pos, model_p, bid, ask, force=False):
-        # Determine exit price based on side
-        exit_px = bid if pos.side == "YES" else (1.0 - ask)
-        exit_px -= SLIPPAGE
+    def _check_exit(self, pos, model_p, bid, ask, q_text, force=False):
+        # Exit logic simplified for YES only context (though NO logic is harmless if kept)
+        exit_px = bid - SLIPPAGE
 
         pnl = (pos.size_qty * exit_px) - pos.cost_basis
         roi = pnl / max(pos.cost_basis, 1e-6)
@@ -285,8 +299,7 @@ class SimulatedTrader:
         should_close = force
         if not force:
             if pos.side == "YES" and model_p < bid: should_close = True
-            elif pos.side == "NO" and model_p > ask: should_close = True
-            elif roi >= 0.20: should_close = True
+            elif roi >= 0.25: should_close = True
 
         if should_close:
             self.balance += (pos.size_qty * exit_px)
@@ -294,27 +307,29 @@ class SimulatedTrader:
             self.positions.remove(pos)
 
             color = "green" if pnl > 0 else "red"
-            msg = "LIQ" if force else "CLOSE"
-            self.log(f"{msg} {pos.side} | PnL: ${pnl:.2f}", style=f"bold {color}")
+            msg_type = "LIQ" if force else "CLOSE"
+            dur = self._format_duration(pos.start_ts)
+
+            log_msg = (
+                f"{msg_type} {pos.side} | {q_text}\n"
+                f"   >> Exit: {exit_px:.3f} | Entry: {pos.avg_entry_px:.3f} | Qty: {pos.size_qty:.1f}\n"
+                f"   >> Held: {dur} | PnL: ${pnl:.2f}"
+            )
+            self.log(log_msg, style=f"bold {color}")
 
 # ==============================================================================
 # 3. UNIFIED UI GENERATION
 # ==============================================================================
 def format_time_left(ms, initial_ms):
     if ms < 0: return "EXP"
-
-    # Color warning if < 10%
     ratio = ms / initial_ms if initial_ms > 0 else 0
     style_tag = "[red]" if ratio < LIQUIDATION_THRESH else ""
     end_tag = "[/]" if ratio < LIQUIDATION_THRESH else ""
-
     seconds = ms // 1000
     m, s = divmod(seconds, 60)
     h, m = divmod(m, 60)
-
     txt = f"{h}h {m}m"
     if h == 0 and m < 10: txt = f"{m}m {s}s"
-
     return f"{style_tag}{txt}{end_tag}"
 
 def get_unified_rows(trader):
@@ -335,6 +350,13 @@ def get_unified_rows(trader):
         mkt_mid = (mkt_bid + mkt_ask) / 2.0
 
         rem_ms = meta['end_ts_ms'] - now_ms
+        pos = pos_map.get(aid)
+
+        # --- CLEANING LOGIC ---
+        # If expired and no position, skip this row completely
+        if rem_ms < 0 and pos is None:
+            continue
+
         model_p = 0.0
         edge_val = 0.0
 
@@ -347,7 +369,6 @@ def get_unified_rows(trader):
                 edge_val = edge_yes if edge_yes > edge_no else edge_no
             except: pass
 
-        pos = pos_map.get(aid)
         pos_str = "-"
         entry_str = "-"
         pnl_str = "-"
@@ -364,7 +385,6 @@ def get_unified_rows(trader):
             pos_str = f"[{side_c}]{pos.side}[/] ({int(pos.size_qty)})"
             entry_str = f"{pos.avg_entry_px:.3f}"
 
-        # Filtering to reduce noise, but keep positions visible
         if pos is None and abs(edge_val) < 0.005 and rem_ms > 3600000:
             continue
 
@@ -385,10 +405,8 @@ def get_unified_rows(trader):
             "has_pos": pos is not None
         })
 
-    # --- STABLE SORTING CHANGE ---
-    # Sort strictly by Question (Alphabetical) to stop shifting
+    # Sort strictly by Question to prevent shifting
     rows.sort(key=lambda x: x['question'])
-
     return rows
 
 def make_layout(trader):
@@ -396,7 +414,7 @@ def make_layout(trader):
     layout.split(
         Layout(name="header", size=3),
         Layout(name="main", ratio=1),
-        Layout(name="footer", size=8)
+        Layout(name="footer", size=20) # Increased size for detailed logs
     )
 
     stats = Table.grid(expand=True)
@@ -413,7 +431,8 @@ def make_layout(trader):
     layout["header"].update(Panel(stats, style="white on black"))
 
     table = Table(title="LIVE MARKET MONITOR & PORTFOLIO", expand=True, border_style="blue", box=box.SIMPLE)
-    table.add_column("Question", ratio=3)
+    # Use overflow="fold" to wrap text instead of truncating
+    table.add_column("Question", ratio=3, overflow="fold")
     table.add_column("Time", justify="center", style="dim")
     table.add_column("Mkt Mid", justify="right", style="magenta")
     table.add_column("Fair", justify="right", style="cyan")
@@ -440,8 +459,12 @@ def make_layout(trader):
 
     log_text = Text()
     for ts, msg, style in list(trader.logs):
-        log_text.append(f"{ts} {msg}\n", style=style)
-    layout["footer"].update(Panel(log_text, title="Logs", border_style="dim"))
+        # Adding separator for readability
+        log_text.append(f"[{ts}] ", style="dim")
+        log_text.append(f"{msg}\n", style=style)
+        log_text.append("-" * 40 + "\n", style="dim")
+
+    layout["footer"].update(Panel(log_text, title="Detailed Activity Log", border_style="dim"))
 
     return layout
 
