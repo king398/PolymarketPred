@@ -4,9 +4,10 @@ import json
 import ast
 import pytz
 from datetime import datetime, timedelta
-
+import os
 # --- CONFIG ---
-OUTPUT_FILE = "clob_token_ids.jsonl" # Adjusted path for portability
+DATA_DIR = "/home/mithil/PycharmProjects/PolymarketPred/data"
+OUTPUT_FILE = os.path.join(DATA_DIR, "clob_token_ids.jsonl")
 BASE_URL = "https://gamma-api.polymarket.com/events/slug/{slug}"
 
 # Symbols
@@ -85,7 +86,7 @@ def parse_tokens(market):
 
     # Safety check for list length
     if raw and len(raw) >= 2:
-        return raw[0], raw[1]
+        return raw[0]
     return None, None
 
 
@@ -119,12 +120,11 @@ async def process_standard_markets(session, category, symbols, interval, count, 
             market = data["markets"][0]
 
             # --- EXTRACT YES AND NO TOKENS ---
-            yes_id, no_id = parse_tokens(market)
+            yes_id = parse_tokens(market)
 
             results.append({
                 "slug": slug,
-                "yes_token_id": yes_id,
-                "no_token_id": no_id,
+                "clob_token_id": yes_id,
                 "market_position": pos,
                 "category": category,
                 "primary_market_timestamp": str(start_ts),
@@ -149,8 +149,8 @@ async def main():
 
                 # 1. 15 Minute
                 # print("Fetching 15m...")
-                all_data.extend(await process_standard_markets(
-                    session, "15m", SYMBOLS_SHORT, "15m", 2, "{symbol}-updown-15m-{param}"))
+                #all_data.extend(await process_standard_markets(
+                #    session, "15m", SYMBOLS_SHORT, "15m", 2, "{symbol}-updown-15m-{param}"))
 
                 # 2. 1 Hour
                 # print("Fetching 1h...")
