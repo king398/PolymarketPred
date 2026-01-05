@@ -9,6 +9,7 @@ warnings.filterwarnings("ignore")
 eps = 1e-12
 
 
+
 class HestonModel:
     """
     Pure Heston stochastic volatility model.
@@ -51,7 +52,7 @@ class HestonModel:
         kill_threshold = 0.2
         if pct_remaining < kill_threshold:
             zone_progress = pct_remaining / kill_threshold
-            decay_factor = zone_progress ** 8
+            decay_factor = zone_progress ** 12
             p[2] *= decay_factor              # sigma_v
             p[4] = max(1e-6, p[4] * (zone_progress ** 2))  # v0
 
@@ -127,7 +128,7 @@ class HestonModel:
         K_norm = K / S
 
         try:
-            P2 = HestonModel._P(K_norm, T, adj_params, P_num=2, limit=1000.0)
+            P2 = HestonModel._P(K_norm, T, adj_params, P_num=2, limit=4000.0)
             return float(np.clip(P2, 0.0, 1.0))
         except Exception:
             return 1.0 if S > K else 0.0

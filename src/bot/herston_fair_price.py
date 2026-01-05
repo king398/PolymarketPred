@@ -4,6 +4,8 @@ BATES-MODEL VALUE ARBITRAGE SIM (Polymarket Up/Down)
 - FULL TEXT: Questions wrap instead of truncate.
 - AUTO-CLEAN: Expired markets are hidden from the scanner.
 - UNIFIED UI: Single table for scanner & portfolio.
+- NEW EXIT: Failsafe exit if Fair Price < Entry Price.
+- TRADE HISTORY: Saves all actions to CSV.
 """
 
 import time
@@ -15,6 +17,7 @@ import os
 import requests
 import warnings
 import numpy as np
+import csv  # <--- NEW IMPORT
 from collections import deque
 from datetime import datetime
 
@@ -41,13 +44,15 @@ DATA_DIR = "/home/mithil/PycharmProjects/PolymarketPred/data"
 ASSET_ID_FILE = os.path.join(DATA_DIR, "clob_token_ids.jsonl")
 PARAMS_FILE = os.path.join(DATA_DIR, "bates_params_digital.jsonl")
 STRIKES_FILE = os.path.join(DATA_DIR,"market_1m_candle_opens.jsonl")
+TRADES_LOG_FILE = os.path.join(DATA_DIR, "sim_trade_history.csv") # <--- NEW FILE
 
 # Strategy Parameters
-MIN_EDGE = 0.03
+MIN_EDGE = 0.02
 MAX_POS_SIZE = 50.0
 SLIPPAGE = 0.0002
-LIQUIDATION_THRESH = 0.05  # 10% time remaining
-
+LIQUIDATION_THRESH = 0.10  # 10% time remaining
+# Risk Management
+THESIS_TOLERANCE = 0.05
 # Execution Parameters
 CHUNK_PCT = 0.5
 CHUNK_DELAY = 2.0
@@ -94,8 +99,8 @@ class DataManager:
                 for line in f:
                     try:
                         obj = json.loads(line)
-                        if "clob_token_id" in obj and "open_price" in obj:
-                            self.strikes[obj["clob_token_id"]] = float(obj["open_price"])
+                        if "clob_token_id" in obj and "strike_price" in obj:
+                            self.strikes[obj["clob_token_id"]] = float(obj["strike_price"])
                     except: pass
 
         if os.path.exists(ASSET_ID_FILE):
@@ -171,6 +176,42 @@ class SimulatedTrader:
         self.realized_pnl = 0.0
         self.logs = deque(maxlen=10)
 
+        # --- CSV INITIALIZATION ---
+        self._init_csv()
+
+    def _init_csv(self):
+        """Creates the trade log CSV with headers if it doesn't exist."""
+        if not os.path.exists(TRADES_LOG_FILE):
+            try:
+                with open(TRADES_LOG_FILE, mode='w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        "timestamp", "action", "question", "asset_id", "side",
+                        "price", "quantity", "cost", "pnl", "reason"
+                    ])
+            except Exception as e:
+                self.log(f"CSV Init Error: {e}", style="red")
+
+    def _save_trade(self, action, pos, price, qty, cost, pnl, reason, question):
+        """Appends a trade record to the CSV file."""
+        try:
+            with open(TRADES_LOG_FILE, mode='a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    datetime.now().isoformat(),
+                    action,
+                    question,
+                    pos.asset_id,
+                    pos.side,
+                    f"{price:.4f}",
+                    f"{qty:.4f}",
+                    f"{cost:.4f}",
+                    f"{pnl:.4f}" if pnl is not None else "",
+                    reason
+                ])
+        except Exception as e:
+            self.log(f"CSV Save Error: {e}", style="red")
+
     def log(self, msg, style="white"):
         ts = time.strftime("%H:%M:%S")
         self.logs.append((ts, msg, style))
@@ -204,6 +245,10 @@ class SimulatedTrader:
             f"   >> Held: {dur} | PnL: ${pnl:.2f}"
         )
         self.log(log_msg, style=f"bold {color}")
+
+        # --- SAVE TRADE ---
+        self._save_trade("SETTLE", pos, payout_val, pos.size_qty, pos.cost_basis, pnl, "EXPIRATION", q_text)
+
         self.positions.remove(pos)
 
     def evaluate(self, aid, market_bid, market_ask):
@@ -224,9 +269,6 @@ class SimulatedTrader:
 
         # 2. Check Auto-Liquidation (Time < 10%)
         time_ratio = rem_ms / meta['initial_duration_ms']
-        if pos and time_ratio < LIQUIDATION_THRESH:
-            self._check_exit(pos, -1, market_bid, market_ask, meta['question'], force=True)
-            return
 
         underlying = meta['underlying']
         spot = self.dm.spot_prices.get(underlying)
@@ -237,7 +279,6 @@ class SimulatedTrader:
         model_p = HestonModel.price_binary_call(spot, strike, T_years, meta['initial_T'], params)
 
         yes_edge = model_p - market_ask
-        # no_edge calculation is removed/ignored for entry logic below
 
         # Position Management
         if pos:
@@ -260,8 +301,6 @@ class SimulatedTrader:
                 if yes_edge > MIN_EDGE:
                     self._start_position(aid, "YES", market_ask, model_p, strike, q_text)
 
-                # The logic for NO positions has been removed here.
-
     def _start_position(self, aid, side, price, model_p, strike, q_text):
         if price <= 0.05 or price >= 0.95: return
         pos = Position(aid, side, strike, model_p)
@@ -282,41 +321,63 @@ class SimulatedTrader:
         pos.avg_entry_px = pos.cost_basis / pos.size_qty
         pos.last_fill_ts = time.time()
 
-        color = "green" # Since only YES is traded, color is always green
+        color = "green"
         msg = f"BUY {pos.side} | {q_text} @ {price:.3f} (Qty: {qty:.1f})"
         self.log(msg, style=f"dim {color}")
+
+        # --- SAVE TRADE ---
+        self._save_trade("BUY", pos, price, qty, chunk, None, "ENTRY_CHUNK", q_text)
 
         if pos.cost_basis >= pos.target_cost * 0.99:
             pos.is_accumulating = False
 
     def _check_exit(self, pos, model_p, bid, ask, q_text, force=False):
-        # Exit logic simplified for YES only context (though NO logic is harmless if kept)
+        # Exit logic simplified for YES only context
         exit_px = bid - SLIPPAGE
 
         pnl = (pos.size_qty * exit_px) - pos.cost_basis
         roi = pnl / max(pos.cost_basis, 1e-6)
 
         should_close = force
+        msg_type = "LIQ" if force else "CLOSE"
+
         if not force:
-            if pos.side == "YES" and model_p < bid: should_close = True
-            elif roi >= 0.25: should_close = True
+            # 1. Existing: Model-Market Arb Exit
+            # If Model says fair value is LESS than what people are bidding, sell into that bid.
+            if pos.side == "YES" and model_p < bid:
+                should_close = True
+                msg_type = "MODEL-ARB-EXIT"
+
+            # 2. Existing: Take Profit
+            elif roi >= 0.25:
+                should_close = True
+                msg_type = "TP-EXIT"
+
+            # --- NEW: THESIS TOLERANCE EXIT ---
+            # If the Model's Fair Value drops below your Entry Price (minus a buffer),
+            # it means the fundamental reason for the trade is gone.
+            elif model_p < (pos.avg_entry_px - THESIS_TOLERANCE):
+                should_close = True
+                msg_type = "THESIS-BROKEN"
 
         if should_close:
-            self.balance += (pos.size_qty * exit_px)
+            revenue = (pos.size_qty * exit_px)
+            self.balance += revenue
             self.realized_pnl += pnl
             self.positions.remove(pos)
 
             color = "green" if pnl > 0 else "red"
-            msg_type = "LIQ" if force else "CLOSE"
             dur = self._format_duration(pos.start_ts)
 
             log_msg = (
                 f"{msg_type} {pos.side} | {q_text}\n"
                 f"   >> Exit: {exit_px:.3f} | Entry: {pos.avg_entry_px:.3f} | Qty: {pos.size_qty:.1f}\n"
-                f"   >> Held: {dur} | PnL: ${pnl:.2f}"
+                f"   >> Fair: {model_p:.3f} | Held: {dur} | PnL: ${pnl:.2f}"
             )
             self.log(log_msg, style=f"bold {color}")
 
+            # --- SAVE TRADE ---
+            self._save_trade("SELL", pos, exit_px, pos.size_qty, pos.cost_basis, pnl, msg_type, q_text)
 # ==============================================================================
 # 3. UNIFIED UI GENERATION
 # ==============================================================================
@@ -347,14 +408,11 @@ def get_unified_rows(trader):
 
         mkt_bid = float(ticks['bid'][-1])
         mkt_ask = float(ticks['ask'][-1])
-        mkt_mid = (mkt_bid + mkt_ask) / 2.0
 
         rem_ms = meta['end_ts_ms'] - now_ms
         pos = pos_map.get(aid)
 
-        # --- CLEANING LOGIC ---
-        # If expired and no position, skip this row completely
-        if rem_ms < 0 and pos is None:
+        if rem_ms < 0 or pos is None:
             continue
 
         model_p = 0.0
@@ -394,7 +452,9 @@ def get_unified_rows(trader):
         rows.append({
             "question": meta['question'],
             "time": format_time_left(rem_ms, meta['initial_duration_ms']),
-            "mid": mkt_mid,
+            "time_ms": rem_ms,
+            "bid": mkt_bid,
+            "ask": mkt_ask,
             "fair": model_p,
             "edge": edge_val,
             "edge_str": edge_str,
@@ -405,8 +465,7 @@ def get_unified_rows(trader):
             "has_pos": pos is not None
         })
 
-    # Sort strictly by Question to prevent shifting
-    rows.sort(key=lambda x: x['question'])
+    rows.sort(key=lambda x: x['time_ms'])
     return rows
 
 def make_layout(trader):
@@ -414,7 +473,7 @@ def make_layout(trader):
     layout.split(
         Layout(name="header", size=3),
         Layout(name="main", ratio=1),
-        Layout(name="footer", size=20) # Increased size for detailed logs
+        Layout(name="footer", size=20)
     )
 
     stats = Table.grid(expand=True)
@@ -431,10 +490,10 @@ def make_layout(trader):
     layout["header"].update(Panel(stats, style="white on black"))
 
     table = Table(title="LIVE MARKET MONITOR & PORTFOLIO", expand=True, border_style="blue", box=box.SIMPLE)
-    # Use overflow="fold" to wrap text instead of truncating
     table.add_column("Question", ratio=3, overflow="fold")
     table.add_column("Time", justify="center", style="dim")
-    table.add_column("Mkt Mid", justify="right", style="magenta")
+    table.add_column("Bid", justify="right", style="green")
+    table.add_column("Ask", justify="right", style="red")
     table.add_column("Fair", justify="right", style="cyan")
     table.add_column("Edge", justify="right")
     table.add_column("Pos (Shares)", justify="center")
@@ -446,7 +505,8 @@ def make_layout(trader):
         table.add_row(
             r['question'],
             r['time'],
-            f"{r['mid']:.3f}",
+            f"{r['bid']:.3f}",
+            f"{r['ask']:.3f}",
             f"{r['fair']:.3f}" if r['fair'] > 0 else "-",
             r['edge_str'],
             r['pos'],
@@ -459,7 +519,6 @@ def make_layout(trader):
 
     log_text = Text()
     for ts, msg, style in list(trader.logs):
-        # Adding separator for readability
         log_text.append(f"[{ts}] ", style="dim")
         log_text.append(f"{msg}\n", style=style)
         log_text.append("-" * 40 + "\n", style="dim")
