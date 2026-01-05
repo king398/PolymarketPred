@@ -6,6 +6,7 @@ BATES-MODEL VALUE ARBITRAGE SIM (Polymarket Up/Down)
 - UNIFIED UI: Single table for scanner & portfolio.
 - NEW EXIT: Failsafe exit if Fair Price < Entry Price.
 - TRADE HISTORY: Saves all actions to CSV.
+- PORTFOLIO STATS: Tracks Invested Cash, Realized PnL & Total Portfolio Value.
 """
 
 import time
@@ -17,7 +18,7 @@ import os
 import requests
 import warnings
 import numpy as np
-import csv  # <--- NEW IMPORT
+import csv
 from collections import deque
 from datetime import datetime
 
@@ -44,7 +45,7 @@ DATA_DIR = "/home/mithil/PycharmProjects/PolymarketPred/data"
 ASSET_ID_FILE = os.path.join(DATA_DIR, "clob_token_ids.jsonl")
 PARAMS_FILE = os.path.join(DATA_DIR, "bates_params_digital.jsonl")
 STRIKES_FILE = os.path.join(DATA_DIR,"market_1m_candle_opens.jsonl")
-TRADES_LOG_FILE = os.path.join(DATA_DIR, "sim_trade_history.csv") # <--- NEW FILE
+TRADES_LOG_FILE = os.path.join(DATA_DIR, "sim_trade_history.csv")
 
 # Strategy Parameters
 MIN_EDGE = 0.02
@@ -175,12 +176,9 @@ class SimulatedTrader:
         self.positions = []
         self.realized_pnl = 0.0
         self.logs = deque(maxlen=10)
-
-        # --- CSV INITIALIZATION ---
         self._init_csv()
 
     def _init_csv(self):
-        """Creates the trade log CSV with headers if it doesn't exist."""
         if not os.path.exists(TRADES_LOG_FILE):
             try:
                 with open(TRADES_LOG_FILE, mode='w', newline='', encoding='utf-8') as f:
@@ -193,7 +191,6 @@ class SimulatedTrader:
                 self.log(f"CSV Init Error: {e}", style="red")
 
     def _save_trade(self, action, pos, price, qty, cost, pnl, reason, question):
-        """Appends a trade record to the CSV file."""
         try:
             with open(TRADES_LOG_FILE, mode='a', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
@@ -227,7 +224,6 @@ class SimulatedTrader:
         return f"{int(diff/60)}m"
 
     def _settle_position(self, pos, final_price_yes, q_text):
-        """Resolves a position at expiration."""
         outcome = 1.0 if final_price_yes >= 0.50 else 0.0
         payout_val = outcome if pos.side == "YES" else (1.0 - outcome)
         total_payout = pos.size_qty * payout_val
@@ -245,10 +241,7 @@ class SimulatedTrader:
             f"   >> Held: {dur} | PnL: ${pnl:.2f}"
         )
         self.log(log_msg, style=f"bold {color}")
-
-        # --- SAVE TRADE ---
         self._save_trade("SETTLE", pos, payout_val, pos.size_qty, pos.cost_basis, pnl, "EXPIRATION", q_text)
-
         self.positions.remove(pos)
 
     def evaluate(self, aid, market_bid, market_ask):
@@ -260,16 +253,13 @@ class SimulatedTrader:
         rem_ms = meta['end_ts_ms'] - now_ms
         pos = self.get_position(aid)
 
-        # 1. Check Expiration
         if rem_ms <= 0:
             if pos:
                 mid = (market_bid + market_ask) / 2.0
                 self._settle_position(pos, mid, meta['question'])
             return
 
-        # 2. Check Auto-Liquidation (Time < 10%)
         time_ratio = rem_ms / meta['initial_duration_ms']
-
         underlying = meta['underlying']
         spot = self.dm.spot_prices.get(underlying)
         params = self.dm.bates_params.get(underlying)
@@ -277,27 +267,20 @@ class SimulatedTrader:
 
         T_years = rem_ms / (1000 * 365 * 24 * 3600.0)
         model_p = HestonModel.price_binary_call(spot, strike, T_years, meta['initial_T'], params)
-
         yes_edge = model_p - market_ask
 
-        # Position Management
         if pos:
             if pos.is_accumulating:
                 if (time.time() - pos.last_fill_ts) >= CHUNK_DELAY:
-                    # Only check YES edge for validity since we only trade YES
                     valid = (pos.side == "YES" and yes_edge > MIN_EDGE)
                     price = market_ask
-
                     if valid: self._execute_chunk(pos, price, meta['question'])
                     else: pos.is_accumulating = False
             else:
                 self._check_exit(pos, model_p, market_bid, market_ask, meta['question'])
         else:
-            # Entry logic (Don't enter if < 10% time left)
             if time_ratio > LIQUIDATION_THRESH:
                 q_text = meta['question']
-
-                # --- MODIFIED: ONLY ENTER YES POSITIONS ---
                 if yes_edge > MIN_EDGE:
                     self._start_position(aid, "YES", market_ask, model_p, strike, q_text)
 
@@ -324,17 +307,13 @@ class SimulatedTrader:
         color = "green"
         msg = f"BUY {pos.side} | {q_text} @ {price:.3f} (Qty: {qty:.1f})"
         self.log(msg, style=f"dim {color}")
-
-        # --- SAVE TRADE ---
         self._save_trade("BUY", pos, price, qty, chunk, None, "ENTRY_CHUNK", q_text)
 
         if pos.cost_basis >= pos.target_cost * 0.99:
             pos.is_accumulating = False
 
     def _check_exit(self, pos, model_p, bid, ask, q_text, force=False):
-        # Exit logic simplified for YES only context
         exit_px = bid - SLIPPAGE
-
         pnl = (pos.size_qty * exit_px) - pos.cost_basis
         roi = pnl / max(pos.cost_basis, 1e-6)
 
@@ -342,42 +321,31 @@ class SimulatedTrader:
         msg_type = "LIQ" if force else "CLOSE"
 
         if not force:
-            # 1. Existing: Model-Market Arb Exit
-            # If Model says fair value is LESS than what people are bidding, sell into that bid.
             if pos.side == "YES" and model_p < bid:
                 should_close = True
                 msg_type = "MODEL-ARB-EXIT"
-
-            # 2. Existing: Take Profit
             elif roi >= 0.25:
                 should_close = True
                 msg_type = "TP-EXIT"
-
-            # --- NEW: THESIS TOLERANCE EXIT ---
-            # If the Model's Fair Value drops below your Entry Price (minus a buffer),
-            # it means the fundamental reason for the trade is gone.
             elif model_p < (pos.avg_entry_px - THESIS_TOLERANCE):
                 should_close = True
                 msg_type = "THESIS-BROKEN"
 
         if should_close:
-            revenue = (pos.size_qty * exit_px)
-            self.balance += revenue
+            self.balance += (pos.size_qty * exit_px)
             self.realized_pnl += pnl
             self.positions.remove(pos)
 
             color = "green" if pnl > 0 else "red"
             dur = self._format_duration(pos.start_ts)
-
             log_msg = (
                 f"{msg_type} {pos.side} | {q_text}\n"
                 f"   >> Exit: {exit_px:.3f} | Entry: {pos.avg_entry_px:.3f} | Qty: {pos.size_qty:.1f}\n"
                 f"   >> Fair: {model_p:.3f} | Held: {dur} | PnL: ${pnl:.2f}"
             )
             self.log(log_msg, style=f"bold {color}")
-
-            # --- SAVE TRADE ---
             self._save_trade("SELL", pos, exit_px, pos.size_qty, pos.cost_basis, pnl, msg_type, q_text)
+
 # ==============================================================================
 # 3. UNIFIED UI GENERATION
 # ==============================================================================
@@ -408,7 +376,6 @@ def get_unified_rows(trader):
 
         mkt_bid = float(ticks['bid'][-1])
         mkt_ask = float(ticks['ask'][-1])
-
         rem_ms = meta['end_ts_ms'] - now_ms
         pos = pos_map.get(aid)
 
@@ -417,7 +384,6 @@ def get_unified_rows(trader):
 
         model_p = 0.0
         edge_val = 0.0
-
         if params and rem_ms > 0:
             T_yrs = rem_ms / (1000 * 365 * 24 * 3600.0)
             try:
@@ -434,6 +400,7 @@ def get_unified_rows(trader):
 
         if pos:
             row_style = "bold yellow" if pos.is_accumulating else "bold white"
+            # Calculate Unrealized PnL based on Mark Price
             mark = mkt_bid if pos.side == "YES" else (1.0 - mkt_ask)
             val = pos.size_qty * mark
             unreal_pnl = val - pos.cost_basis
@@ -476,19 +443,47 @@ def make_layout(trader):
         Layout(name="footer", size=20)
     )
 
+    # --- PORTFOLIO CALCULATIONS ---
+    invested_cash = sum(p.cost_basis for p in trader.positions)
+    positions_value = 0.0
+
+    # Calculate Market Value of Open Positions
+    for p in trader.positions:
+        ticks = state_ticks.get(p.asset_id)
+        if ticks is not None and len(ticks) > 0:
+            current_bid = float(ticks['bid'][-1])
+            current_ask = float(ticks['ask'][-1])
+            # Conservative Liquidation Value
+            # If YES: Sell into Bid. If NO: Buy back at Ask.
+            price = current_bid if p.side == "YES" else (1.0 - current_ask)
+            positions_value += p.size_qty * price
+        else:
+            # Fallback to cost if no live data
+            positions_value += p.cost_basis
+
+    total_account_value = trader.balance + positions_value
+    total_pnl = total_account_value - 1000.0  # Assumes 1000 start
+
+    # Colors
+    pnl_color = "green" if total_pnl >= 0 else "red"
+    realized_color = "green" if trader.realized_pnl >= 0 else "red"
+
+    # --- HEADER DISPLAY ---
     stats = Table.grid(expand=True)
     stats.add_column(justify="center", ratio=1)
     stats.add_column(justify="center", ratio=1)
     stats.add_column(justify="center", ratio=1)
 
     spot_txt = " | ".join([f"{k} ${v:3f}" for k,v in trader.dm.spot_prices.items()])
+
     stats.add_row(
-        f"[bold blue]Cash: ${trader.balance:.2f}[/]",
-        f"[bold yellow]Realized PnL: ${trader.realized_pnl:.2f}[/]",
+        f"[bold]Total Value: ${total_account_value:.2f}[/]  |  [bold {pnl_color}]Net PnL: ${total_pnl:+.2f}[/]",
+        f"Cash: ${trader.balance:.2f}  |  [yellow]Inv: ${invested_cash:.2f}[/]  |  [bold {realized_color}]Realized: ${trader.realized_pnl:+.2f}[/]",
         f"[dim]{spot_txt}[/]"
     )
     layout["header"].update(Panel(stats, style="white on black"))
 
+    # --- MAIN TABLE ---
     table = Table(title="LIVE MARKET MONITOR & PORTFOLIO", expand=True, border_style="blue", box=box.SIMPLE)
     table.add_column("Question", ratio=3, overflow="fold")
     table.add_column("Time", justify="center", style="dim")
@@ -517,6 +512,7 @@ def make_layout(trader):
 
     layout["main"].update(table)
 
+    # --- FOOTER LOGS ---
     log_text = Text()
     for ts, msg, style in list(trader.logs):
         log_text.append(f"[{ts}] ", style="dim")
