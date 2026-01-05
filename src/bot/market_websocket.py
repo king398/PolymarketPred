@@ -169,6 +169,7 @@ async def stream_polymarket(b: Broadcaster, asset_ids: List[str]) -> None:
                                 asks = data.get("asks") or []
                                 bb = float(bids[0]["price"]) if bids else None
                                 ba = float(asks[0]["price"]) if asks else None
+
                                 updates.append((aid, bb, ba))
 
                         for aid, new_bid, new_ask in updates:

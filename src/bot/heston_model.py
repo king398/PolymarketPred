@@ -54,7 +54,7 @@ class HestonModel:
             zone_progress = pct_remaining / kill_threshold
             decay_factor = zone_progress ** 12
             p[2] *= decay_factor              # sigma_v
-            p[4] = max(1e-6, p[4] * (zone_progress ** 2))  # v0
+            p[4] = max(1e-6, p[4] * (zone_progress ** 3))  # v0
 
         # Same "locking factor" heuristic on kappa in last minutes
         if minutes_remaining < 5:

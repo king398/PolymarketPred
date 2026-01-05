@@ -324,9 +324,9 @@ class SimulatedTrader:
             if pos.side == "YES" and model_p < bid:
                 should_close = True
                 msg_type = "MODEL-ARB-EXIT"
-            elif roi >= 0.25:
+            elif roi >= 0.10:
                 should_close = True
-                msg_type = "TP-EXIT"
+                msg_type = "TAKE-PROFIT"
             elif model_p < (pos.avg_entry_px - THESIS_TOLERANCE):
                 should_close = True
                 msg_type = "THESIS-BROKEN"
