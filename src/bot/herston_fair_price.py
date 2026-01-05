@@ -314,6 +314,7 @@ class SimulatedTrader:
 
     def _check_exit(self, pos, model_p, bid, ask, q_text, force=False):
         exit_px = bid - SLIPPAGE
+
         pnl = (pos.size_qty * exit_px) - pos.cost_basis
         roi = pnl / max(pos.cost_basis, 1e-6)
 
