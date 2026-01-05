@@ -6,6 +6,7 @@ import pytz
 import re
 import os
 import logging
+import warnings
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional, List, Tuple
 
@@ -16,6 +17,9 @@ CANDLE_OUTPUT_FILE = os.path.join(DATA_DIR, "market_1m_candle_opens.jsonl")
 
 POLY_BASE_URL = "https://gamma-api.polymarket.com/events/slug/{slug}"
 BINANCE_API = "https://api.binance.com/api/v3/klines"
+
+# Silence NumPy Deprecation Warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # Logging setup
 logging.basicConfig(
@@ -63,21 +67,18 @@ def extract_strike_from_slug(slug: str) -> Optional[float]:
     Ex: 'xrp-above-2pt1-on...' -> 2.1
     """
     try:
-        # Regex: find text between "above-" and "-on"
         match = re.search(r'above-(.*?)-on', slug)
         if not match:
             return None
 
         raw_val = match.group(1)
 
-        # Normalize 'k' (thousands)
         if 'k' in raw_val:
             raw_val = raw_val.replace('k', '')
             multiplier = 1000
         else:
             multiplier = 1
 
-        # Normalize 'pt' (decimal points)
         if 'pt' in raw_val:
             raw_val = raw_val.replace('pt', '.')
 
@@ -91,7 +92,6 @@ def infer_binance_symbol(slug: str, question: str) -> Optional[str]:
     slug_lower = slug.lower()
     q_lower = question.lower()
 
-    # Check explicit keys
     for key, val in BINANCE_MAP.items():
         if f"{key}-" in slug_lower or key in q_lower:
             return val
@@ -111,7 +111,6 @@ def generate_buckets(interval, count) -> List[Tuple[str, datetime]]:
         delta = timedelta(hours=4)
         fmt_func = lambda dt: int(dt.timestamp())
     elif interval == "1d":
-        # Daily Logic: If past 12pm ET, start tomorrow. Else, today.
         if now.hour >= 12:
             start = now.replace(hour=12, minute=0, second=0, microsecond=0) + timedelta(days=1)
         else:
@@ -152,12 +151,6 @@ async def fetch_slug(session, slug):
     return None
 
 async def process_weekly_markets(session, count):
-    """
-    Weekly logic:
-    1. Slug date = End Date (12 PM ET)
-    2. Start Date = End Date - 5 Days
-    3. Extract Strike from slug
-    """
     tasks = []
     buckets = generate_buckets("1d", count)
     pattern = "{symbol}-above-on-{param}"
@@ -178,13 +171,11 @@ async def process_weekly_markets(session, count):
 
         for market in data["markets"]:
             try:
-                # Filter decided markets
                 prices = parse_prices(market)
                 prices = [float(p) for p in prices if p is not None]
                 if not prices or max(prices) > 0.95 or min(prices) < 0.05:
                     continue
 
-                # STRICTLY extract strike for weeklies
                 strike = extract_strike_from_slug(market['slug'])
 
                 results.append({
@@ -233,9 +224,6 @@ async def process_standard_markets(session, category, symbols, interval, count, 
         try:
             market = data["markets"][0]
 
-            # Standard markets do not have strike in slug (Up/Down)
-            # We set this to None explicitly
-
             results.append({
                 "slug": slug,
                 "clob_token_id": parse_tokens(market),
@@ -256,7 +244,7 @@ async def process_standard_markets(session, category, symbols, interval, count, 
 
 async def fetch_binance_candle(session, symbol: str, open_ms: int) -> Optional[Dict]:
     params = {"symbol": symbol, "interval": "1m", "startTime": open_ms, "limit": 1}
-    # Retry logic
+    # Simple retry loop
     for i in range(5):
         try:
             async with session.get(BINANCE_API, params=params, timeout=10) as resp:
@@ -274,11 +262,11 @@ async def fetch_binance_candle(session, symbol: str, open_ms: int) -> Optional[D
                             }
         except Exception:
             pass
-        await asyncio.sleep(1.5 * (i + 1))
+        await asyncio.sleep(2)
     return None
 
 async def fulfill_market(market_data: Dict, processed_set: set):
-    """Waits for start time, fetches binance price, writes to output."""
+    """Waits for start time + 60s, fetches binance price, writes to output."""
     cid = market_data.get('clob_token_id')
     slug = market_data.get('slug')
 
@@ -290,14 +278,19 @@ async def fulfill_market(market_data: Dict, processed_set: set):
         log.error(f"Date parse error {slug}: {e}")
         return
 
-    # 2. Wait logic
+    # 2. Wait logic (UPDATED: Wait until 60s AFTER open)
     wait_ms = start_ms - now_ms()
-    if wait_ms > 0:
-        wait_sec = wait_ms / 1000.0
-        # Only log if it's a short wait, otherwise it spams
+
+    # We calculate delay including a 60s buffer to ensure candle is closed/ready
+    wait_sec = (wait_ms / 1000.0) + 60.0
+
+    if wait_sec > 0:
         if wait_sec < 3600:
-            log.info(f"⏳ Waiting {wait_sec:.1f}s for open: {slug}")
-        await asyncio.sleep(wait_sec + 2.0) # +2s buffer
+            log.info(f"⏳ Waiting {wait_sec:.1f}s (incl. buffer) for open: {slug}")
+        await asyncio.sleep(wait_sec)
+    elif wait_sec < -300:
+        # If we are excessively late (e.g. 5 mins past), proceed, but logging might be useful
+        pass
 
     # 3. Fetch Binance
     symbol = infer_binance_symbol(slug, market_data.get('question', ''))
@@ -310,13 +303,7 @@ async def fulfill_market(market_data: Dict, processed_set: set):
 
     # 4. Save
     if candle:
-        # LOGIC:
-        # If strike_price (from slug) exists -> Use it (Weekly)
-        # If strike_price is None -> Use Candle Open (Standard)
         slug_strike = market_data.get("strike_price")
-
-        # --- FIXED LOGIC ---
-        # If slug_strike is None, use the Candle Open price as the strike
         if slug_strike is None:
             final_strike = candle["open"]
         else:
@@ -353,7 +340,7 @@ async def discovery_loop(queue: asyncio.Queue, seen_ids: set):
             async with aiohttp.ClientSession() as session:
                 new_batch = []
 
-                # 1. Standard Markets (Strike will be None)
+                # 1. Standard Markets
                 new_batch.extend(await process_standard_markets(
                     session, "1h", SYMBOLS_LONG, "1h", 2, "{symbol}-up-or-down-{param}-et"
                 ))
@@ -364,7 +351,7 @@ async def discovery_loop(queue: asyncio.Queue, seen_ids: set):
                     session, "1d", SYMBOLS_LONG, "1d", 2, "{symbol}-up-or-down-on-{param}"
                 ))
 
-                # 2. Weekly Markets (Strike extracted from slug)
+                # 2. Weekly Markets
                 new_batch.extend(await process_weekly_markets(session, 9))
 
                 # 3. Process Batch
@@ -393,7 +380,6 @@ async def processing_loop(queue: asyncio.Queue, processed_strikes: set):
     log.info("[System] Processing Loop Started")
     while True:
         market = await queue.get()
-        # Spawn a background task for this market so we don't block the queue
         asyncio.create_task(fulfill_market(market, processed_strikes))
         queue.task_done()
 
@@ -402,7 +388,6 @@ async def processing_loop(queue: asyncio.Queue, processed_strikes: set):
 # -----------------------------------------------------------------------------
 
 async def main():
-    # 1. Load History to avoid duplicates
     seen_ids = set()
     processed_strikes = set()
 
@@ -426,10 +411,8 @@ async def main():
 
     log.info(f"Loaded {len(seen_ids)} known markets and {len(processed_strikes)} captured strikes.")
 
-    # 2. Setup Queue
     queue = asyncio.Queue()
 
-    # 3. Populate Queue with existing IDs that haven't been struck yet (Resume capability)
     if os.path.exists(MARKET_ID_FILE):
         with open(MARKET_ID_FILE, 'r') as f:
             for line in f:
@@ -437,14 +420,11 @@ async def main():
                     m = json.loads(line)
                     cid = m.get('clob_token_id')
                     if cid and cid not in processed_strikes:
-                        # Reprocessing history: Check if it's too old to bother?
-                        # For now, just add it. The fetcher handles expired data gracefully.
                         queue.put_nowait(m)
                 except: pass
 
     log.info(f"Queued {queue.qsize()} pending markets from file history.")
 
-    # 4. Start Loops
     await asyncio.gather(
         discovery_loop(queue, seen_ids),
         processing_loop(queue, processed_strikes)

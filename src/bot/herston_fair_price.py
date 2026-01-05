@@ -7,6 +7,7 @@ BATES-MODEL VALUE ARBITRAGE SIM (Polymarket Up/Down)
 - NEW EXIT: Failsafe exit if Fair Price < Entry Price.
 - TRADE HISTORY: Saves all actions to CSV.
 - PORTFOLIO STATS: Tracks Invested Cash, Realized PnL & Total Portfolio Value.
+- STATE RESTORE: Reloads positions and balance from CSV on restart.
 """
 
 import time
@@ -176,7 +177,9 @@ class SimulatedTrader:
         self.positions = []
         self.realized_pnl = 0.0
         self.logs = deque(maxlen=10)
+
         self._init_csv()
+        self._restore_history()
 
     def _init_csv(self):
         if not os.path.exists(TRADES_LOG_FILE):
@@ -189,6 +192,97 @@ class SimulatedTrader:
                     ])
             except Exception as e:
                 self.log(f"CSV Init Error: {e}", style="red")
+
+    def _restore_history(self):
+        """Reconstructs state from the CSV log."""
+        if not os.path.exists(TRADES_LOG_FILE):
+            return
+
+        self.log("Restoring history from CSV...", style="bold yellow")
+        try:
+            with open(TRADES_LOG_FILE, mode='r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+
+            # Reset state variables to base values, then replay history
+            self.balance = 1000.0
+            self.positions = []
+            self.realized_pnl = 0.0
+
+            # Temporary dict to track active position objects by asset_id
+            active_positions = {}
+
+            for row in rows:
+                action = row['action']
+                aid = row['asset_id']
+                side = row['side']
+
+                # Safe parsing
+                try:
+                    price = float(row['price']) if row['price'] else 0.0
+                    qty = float(row['quantity']) if row['quantity'] else 0.0
+                    cost = float(row['cost']) if row['cost'] else 0.0
+                    # pnl might be empty string for BUY rows
+                    pnl = float(row['pnl']) if row['pnl'] and row['pnl'].strip() else 0.0
+                except ValueError:
+                    continue
+
+                # Timestamp parsing
+                ts_str = row['timestamp']
+                try:
+                    dt = datetime.fromisoformat(ts_str)
+                    ts = dt.timestamp()
+                except:
+                    ts = time.time()
+
+                if action == 'BUY':
+                    self.balance -= cost
+
+                    if aid not in active_positions:
+                        # Attempt to find strike from data manager if loaded
+                        strike = self.dm.strikes.get(aid, 0.0)
+                        pos = Position(aid, side, strike, 0.0)
+                        pos.start_ts = ts
+                        active_positions[aid] = pos
+
+                    pos = active_positions[aid]
+                    pos.cost_basis += cost
+                    pos.size_qty += qty
+                    if pos.size_qty > 0:
+                        pos.avg_entry_px = pos.cost_basis / pos.size_qty
+                    pos.last_fill_ts = ts
+                    # Don't assume accumulating on restart to avoid immediate double-buys
+                    pos.is_accumulating = False
+
+                elif action in ['SELL', 'LIQ', 'TAKE-PROFIT', 'THESIS-BROKEN', 'MODEL-ARB-EXIT']:
+                    # Reconstruct Revenue: For SELL, we sold qty at price.
+                    revenue = qty * price
+                    self.balance += revenue
+                    self.realized_pnl += pnl
+
+                    # Remove position (Sim assumes full exit on sell signal)
+                    if aid in active_positions:
+                        del active_positions[aid]
+
+                elif action == 'SETTLE':
+                    # Reconstruct Payout: For SETTLE, price is usually the payout scalar (0 or 1)
+                    # Total payout = qty * price
+                    total_payout = qty * price
+                    self.balance += total_payout
+                    self.realized_pnl += pnl
+
+                    if aid in active_positions:
+                        del active_positions[aid]
+
+            # Finalize positions list
+            self.positions = list(active_positions.values())
+
+            # Log results
+            self.log(f"Restored {len(self.positions)} active positions.", style="green")
+            self.log(f"Restored Bal: ${self.balance:.2f} | R.PnL: ${self.realized_pnl:.2f}", style="green")
+
+        except Exception as e:
+            self.log(f"Error restoring history: {e}", style="red")
 
     def _save_trade(self, action, pos, price, qty, cost, pnl, reason, question):
         try:
@@ -258,7 +352,9 @@ class SimulatedTrader:
                 mid = (market_bid + market_ask) / 2.0
                 self._settle_position(pos, mid, meta['question'])
             return
-
+        if pos and market_bid <= 0.02:
+            # Optional: Log it once so you know it's working (uses self.log)
+            return
         time_ratio = rem_ms / meta['initial_duration_ms']
         underlying = meta['underlying']
         spot = self.dm.spot_prices.get(underlying)
@@ -285,7 +381,7 @@ class SimulatedTrader:
                     self._start_position(aid, "YES", market_ask, model_p, strike, q_text)
 
     def _start_position(self, aid, side, price, model_p, strike, q_text):
-        if price <= 0.05 or price >= 0.95: return
+        if price <= 0.15 or price >= 0.95: return
         pos = Position(aid, side, strike, model_p)
         self.positions.append(pos)
         self._execute_chunk(pos, price, q_text)
