@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 from scipy.integrate import quad
 from scipy.optimize import minimize
@@ -6,103 +8,9 @@ import requests
 from datetime import datetime
 from typing import Tuple, List, Optional
 import warnings
-
+from heston_model import FastHestonModel
 warnings.filterwarnings("ignore")
 
-# --- Optional Numba JIT for Speed ---
-try:
-    from numba import jit
-    HAS_NUMBA = True
-    jit_decorator = jit(nopython=True, cache=True, fastmath=True)
-except ImportError:
-    HAS_NUMBA = False
-
-    def jit_decorator(func):
-        return func
-
-
-# -------------------------------------------------------------------------
-# 1. Heston Model Math (JIT)
-# -------------------------------------------------------------------------
-
-@jit_decorator
-def _heston_cf_core(phi: complex, T: float, params: np.ndarray, P_num: int) -> complex:
-    """
-    Heston characteristic function core (normalized S=1, r=0, q=0).
-    params: [kappa, theta, sigma_v, rho, v0]
-    """
-    kappa, theta, sigma_v, rho, v0 = params
-    i = 1j
-
-    if P_num == 1:
-        u = 0.5
-        b = kappa - rho * sigma_v
-    else:
-        u = -0.5
-        b = kappa
-
-    a = kappa * theta
-    sig_v2 = sigma_v * sigma_v + 1e-20
-
-    d = np.sqrt((rho * sigma_v * phi * i - b) ** 2 - sig_v2 * (2.0 * u * phi * i - phi * phi))
-    g = (b - rho * sigma_v * phi * i - d) / (b - rho * sigma_v * phi * i + d + 1e-20)
-    exp_dt = np.exp(-d * T)
-
-    val_log = (1.0 - g * exp_dt) / (1.0 - g + 1e-20)
-    C = (a / sig_v2) * ((b - rho * sigma_v * phi * i - d) * T - 2.0 * np.log(val_log))
-    D = ((b - rho * sigma_v * phi * i - d) / sig_v2) * ((1.0 - exp_dt) / (1.0 - g * exp_dt + 1e-20))
-
-    return np.exp(C + D * v0)
-
-
-@jit_decorator
-def _integrand_real_heston(phi: float, K_norm: float, T: float, params: np.ndarray, P_num: int) -> float:
-    if np.abs(phi) < 1e-9:
-        return 0.0
-    cf_val = _heston_cf_core(phi, T, params, P_num)
-    val = np.exp(-1j * phi * np.log(K_norm)) * cf_val / (1j * phi)
-    return float(np.real(val))
-
-
-class HestonModel:
-    """
-    Pure Heston stochastic volatility model (normalized S space).
-    We price the DIGITAL call via P2 using Gil-Pelaez.
-    """
-
-    @staticmethod
-    def _adjust_params(T: float, params: List[float]) -> np.ndarray:
-        p = np.array(params, dtype=np.float64)
-        # Mild stabilization for very short T to prevent numerical blowups
-        if T < 0.02:
-            p[2] *= (T / 0.02) ** 0.5  # damp sigma_v
-        return p
-
-    @staticmethod
-    def price_binary_call(S: float, K: float, T: float, params: List[float]) -> float:
-        """
-        Digital call paying 1 if ST > K, with r≈0.
-        For digitals, price = P2 under this convention.
-        """
-        if T <= 1e-6:
-            return 1.0 if S > K else 0.0
-
-        p_arr = HestonModel._adjust_params(T, params)
-        K_norm = K / S
-
-        limit = 500.0
-        try:
-            val_int, _ = quad(
-                _integrand_real_heston,
-                1e-9,
-                limit,
-                args=(K_norm, T, p_arr, 2),
-                limit=50,
-            )
-            p2 = 0.5 + (1.0 / np.pi) * val_int
-            return float(np.clip(p2, 0.0, 1.0))
-        except Exception:
-            return 0.5
 
 
 # -------------------------------------------------------------------------
@@ -258,7 +166,7 @@ class HestonCalibrator:
 
             err = 0.0
             for i, k_val in enumerate(K):
-                model_val = HestonModel.price_binary_call(1.0, float(k_val), float(T), list(p))
+                model_val = FastHestonModel.price_binary_call(1.0, float(k_val), float(T), list(p))
 
                 # Weight ATM more heavily
                 w = np.exp(-((k_val - 1.0) / 0.15) ** 2)
@@ -314,8 +222,6 @@ if __name__ == "__main__":
     results = []
 
     print("--- HESTON CALIBRATION (DERIBIT OPTIONS -> DIGITAL FIT) ---")
-    if HAS_NUMBA:
-        print(">> JIT Acceleration: ACTIVE")
 
     for a in assets:
         print(f"\n[{a}] Starting...")
@@ -332,8 +238,8 @@ if __name__ == "__main__":
         df = pd.DataFrame(results)
         print("\n--- FINAL PARAMETERS ---")
         print(df[["currency", "kappa", "theta", "sigma_v", "rho", "v0"]].head())
-
-        filename = "/home/mithil/PycharmProjects/PolymarketPred/data/bates_params_digital.jsonl"
+        DATA_DIR = os.path.join(os.getcwd(), "data")
+        filename = os.path.join(DATA_DIR, "bates_params_digital.jsonl")
         df.to_json(filename, orient="records", lines=True)
         print(f"\nSaved to {filename}")
     else:

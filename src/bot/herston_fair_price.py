@@ -25,7 +25,6 @@ from collections import deque
 from datetime import datetime
 
 # --- RICH IMPORTS ---
-from rich.console import Console
 from rich.layout import Layout
 from rich.panel import Panel
 from rich.table import Table
@@ -34,7 +33,7 @@ from rich import box
 from rich.text import Text
 
 # --- MODEL IMPORT ---
-from heston_model import HestonModel
+from heston_model import FastHestonModel
 
 warnings.filterwarnings("ignore")
 
@@ -364,7 +363,7 @@ class SimulatedTrader:
         if not (spot and params): return
 
         T_years = rem_ms / (1000 * 365 * 24 * 3600.0)
-        model_p = HestonModel.price_binary_call(spot, strike, T_years, meta['initial_T'], params)
+        model_p = FastHestonModel.price_binary_call(spot, strike, T_years, meta['initial_T'], params)
         yes_edge = model_p - market_ask
 
         if pos:
@@ -505,7 +504,7 @@ def get_unified_rows(trader):
         if params and rem_ms > 0:
             T_yrs = rem_ms / (1000 * 365 * 24 * 3600.0)
             try:
-                model_p = HestonModel.price_binary_call(spot, strike, T_yrs, meta['initial_T'], params)
+                model_p = FastHestonModel.price_binary_call(spot, strike, T_yrs, meta['initial_T'], params)
                 edge_yes = model_p - mkt_ask
                 edge_no = mkt_bid - model_p
                 edge_val = edge_yes if edge_yes > edge_no else edge_no
