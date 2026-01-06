@@ -158,7 +158,7 @@ async def process_weekly_markets(session, count):
     for symbol in SYMBOLS_LONG:
         for i, (url_param, ts) in enumerate(buckets):
             market_end = ts
-            market_start = ts - timedelta(days=5)
+            market_start = ts - timedelta(days=6)
             slug = pattern.format(symbol=symbol, param=url_param)
             tasks.append((slug, i, market_start, market_end))
 
