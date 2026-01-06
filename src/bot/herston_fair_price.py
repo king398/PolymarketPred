@@ -43,7 +43,9 @@ ZMQ_ADDR = "tcp://127.0.0.1:5567"
 BINANCE_API = "https://api.binance.com/api/v3/ticker/price"
 
 # File Paths
-DATA_DIR = "/home/ubuntu/PolymarketPred/data"
+# Change this to use the current directory or a relative path
+DATA_DIR = os.path.join(os.getcwd(), "data")
+# OR ensure the folder /home/ubuntu/PolymarketPred/data actually exists and contains files.
 ASSET_ID_FILE = os.path.join(DATA_DIR, "clob_token_ids.jsonl")
 PARAMS_FILE = os.path.join(DATA_DIR, "bates_params_digital.jsonl")
 STRIKES_FILE = os.path.join(DATA_DIR, "market_1m_candle_opens.jsonl")
@@ -669,7 +671,7 @@ async def zmq_loop(trader):
                 bid = float(arr['bid'][-1])
                 ask = float(arr['ask'][-1])
                 trader.evaluate(aid, bid, ask)
-
+                print(f"Processed {aid} | Bid: {bid:.3f} | Ask: {ask:.3f}")
         except Exception:
             await asyncio.sleep(0.1)
 
@@ -684,10 +686,10 @@ async def main():
     asyncio.create_task(zmq_loop(trader))
     asyncio.create_task(dm.watch_metadata())
 
-    with Live(make_layout(trader), refresh_per_second=4, screen=True) as live:
-        while True:
-            live.update(make_layout(trader))
-            await asyncio.sleep(0.25)
+    #with Live(make_layout(trader), refresh_per_second=4, screen=True) as live:
+    #    while True:
+    #        live.update(make_layout(trader))
+    #        await asyncio.sleep(0.25)
 
 
 if __name__ == "__main__":

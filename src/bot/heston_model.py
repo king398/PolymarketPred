@@ -128,7 +128,7 @@ class HestonModel:
         K_norm = K / S
 
         try:
-            P2 = HestonModel._P(K_norm, T, adj_params, P_num=2, limit=4000.0)
+            P2 = HestonModel._P(K_norm, T, adj_params, P_num=2, limit=2000.0)
             return float(np.clip(P2, 0.0, 1.0))
         except Exception:
             return 1.0 if S > K else 0.0
