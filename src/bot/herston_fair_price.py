@@ -671,7 +671,7 @@ async def zmq_loop(trader):
                 bid = float(arr['bid'][-1])
                 ask = float(arr['ask'][-1])
                 trader.evaluate(aid, bid, ask)
-                print(f"Processed {aid} | Bid: {bid:.3f} | Ask: {ask:.3f}")
+                #print(f"Processed {aid} | Bid: {bid:.3f} | Ask: {ask:.3f}")
         except Exception:
             await asyncio.sleep(0.1)
 
@@ -688,7 +688,7 @@ async def main():
 
     with Live(make_layout(trader), refresh_per_second=4, screen=True) as live:
         while True:
-            #live.update(make_layout(trader))
+            live.update(make_layout(trader))
             await asyncio.sleep(0.25)
 
 
