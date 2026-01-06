@@ -5,7 +5,7 @@ import re
 from typing import Any, Dict, List, Set
 import orjson
 import json
-
+import os
 # Try to use uvloop for performance
 try:
     import uvloop
@@ -18,7 +18,9 @@ json_lib = orjson
 # --- CONFIG ---
 POLY_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 BINANCE_WS_URL = "wss://fstream.binance.com/ws"  # USDS-M Futures
-ASSET_ID_FILE = "/home/ubuntu/PolymarketPred/data/clob_token_ids.jsonl"
+DATA_DIR = os.path.join(os.getcwd(), "data")
+ASSET_ID_FILE = os.path.join(DATA_DIR, "clob_token_ids.jsonl")
+
 BIND_HOST = "127.0.0.1"
 BIND_PORT = 9000
 FILE_CHECK_INTERVAL = 60

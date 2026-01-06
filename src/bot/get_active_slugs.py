@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional, List, Tuple
 
 # --- CONFIG ---
-DATA_DIR = "/home/ubuntu/PolymarketPred/data"
+DATA_DIR = os.path.join(os.getcwd(), "data")
 MARKET_ID_FILE = os.path.join(DATA_DIR, "clob_token_ids.jsonl")
 CANDLE_OUTPUT_FILE = os.path.join(DATA_DIR, "market_1m_candle_opens.jsonl")
 
