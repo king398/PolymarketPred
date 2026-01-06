@@ -686,10 +686,10 @@ async def main():
     asyncio.create_task(zmq_loop(trader))
     asyncio.create_task(dm.watch_metadata())
 
-    #with Live(make_layout(trader), refresh_per_second=4, screen=True) as live:
-    #    while True:
-    #        live.update(make_layout(trader))
-    #        await asyncio.sleep(0.25)
+    with Live(make_layout(trader), refresh_per_second=4, screen=True) as live:
+        while True:
+            #live.update(make_layout(trader))
+            await asyncio.sleep(0.25)
 
 
 if __name__ == "__main__":
