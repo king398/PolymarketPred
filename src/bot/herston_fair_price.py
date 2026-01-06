@@ -8,6 +8,7 @@ BATES-MODEL VALUE ARBITRAGE SIM (Polymarket Up/Down)
 - TRADE HISTORY: Saves all actions to CSV.
 - PORTFOLIO STATS: Tracks Invested Cash, Realized PnL & Total Portfolio Value.
 - STATE RESTORE: Reloads positions and balance from CSV on restart.
+- COOLDOWN: Enforces 60s wait after thesis break before re-entry.
 """
 
 import time
@@ -45,7 +46,7 @@ BINANCE_API = "https://api.binance.com/api/v3/ticker/price"
 DATA_DIR = "/home/mithil/PycharmProjects/PolymarketPred/data"
 ASSET_ID_FILE = os.path.join(DATA_DIR, "clob_token_ids.jsonl")
 PARAMS_FILE = os.path.join(DATA_DIR, "bates_params_digital.jsonl")
-STRIKES_FILE = os.path.join(DATA_DIR,"market_1m_candle_opens.jsonl")
+STRIKES_FILE = os.path.join(DATA_DIR, "market_1m_candle_opens.jsonl")
 TRADES_LOG_FILE = os.path.join(DATA_DIR, "sim_trade_history.csv")
 
 # Strategy Parameters
@@ -53,6 +54,8 @@ MIN_EDGE = 0.02
 MAX_POS_SIZE = 50.0
 SLIPPAGE = 0.0002
 LIQUIDATION_THRESH = 0.10  # 10% time remaining
+COOLDOWN_DURATION = 60.0  # Seconds to wait after thesis break
+
 # Risk Management
 THESIS_TOLERANCE = 0.05
 # Execution Parameters
@@ -74,7 +77,8 @@ tick_dtype = np.dtype([
     ("ask", np.float32),
 ])
 
-state_ticks = {} # Global ticker store
+state_ticks = {}  # Global ticker store
+
 
 # ==============================================================================
 # 1. DATA MANAGEMENT
@@ -94,7 +98,8 @@ class DataManager:
                     try:
                         p = json.loads(line)
                         self.bates_params[p['currency']] = p
-                    except: pass
+                    except:
+                        pass
 
         if os.path.exists(STRIKES_FILE):
             with open(STRIKES_FILE, "r") as f:
@@ -103,7 +108,8 @@ class DataManager:
                         obj = json.loads(line)
                         if "clob_token_id" in obj and "strike_price" in obj:
                             self.strikes[obj["clob_token_id"]] = float(obj["strike_price"])
-                    except: pass
+                    except:
+                        pass
 
         if os.path.exists(ASSET_ID_FILE):
             with open(ASSET_ID_FILE, "r") as f:
@@ -113,10 +119,14 @@ class DataManager:
                         m = json.loads(line)
                         slug = m.get('slug', '').lower()
                         underlying = None
-                        if 'bitcoin' in slug or 'btc' in slug: underlying = "BTC"
-                        elif 'ethereum' in slug or 'eth' in slug: underlying = "ETH"
-                        elif 'solana' in slug or 'sol' in slug: underlying = "SOL"
-                        elif 'xrp' in slug: underlying = "XRP"
+                        if 'bitcoin' in slug or 'btc' in slug:
+                            underlying = "BTC"
+                        elif 'ethereum' in slug or 'eth' in slug:
+                            underlying = "ETH"
+                        elif 'solana' in slug or 'sol' in slug:
+                            underlying = "SOL"
+                        elif 'xrp' in slug:
+                            underlying = "XRP"
 
                         if underlying and m.get('clob_token_id'):
                             cat = m.get('category', '1h')
@@ -131,7 +141,8 @@ class DataManager:
                                 "initial_T": t_years,
                                 "initial_duration_ms": t_years * YEAR_MS
                             }
-                    except: pass
+                    except:
+                        pass
         return len(self.strikes)
 
     async def watch_metadata(self):
@@ -147,8 +158,10 @@ class DataManager:
                     r = requests.get(BINANCE_API, params={"symbol": ticker}, timeout=2)
                     if r.status_code == 200:
                         self.spot_prices[sym] = float(r.json()['price'])
-            except Exception: pass
+            except Exception:
+                pass
             await asyncio.sleep(1.0)
+
 
 # ==============================================================================
 # 2. TRADING ENGINE
@@ -170,6 +183,7 @@ class Position:
         self.last_fill_ts = 0
         self.is_accumulating = True
 
+
 class SimulatedTrader:
     def __init__(self, data_manager: DataManager):
         self.dm = data_manager
@@ -177,6 +191,9 @@ class SimulatedTrader:
         self.positions = []
         self.realized_pnl = 0.0
         self.logs = deque(maxlen=10)
+
+        # New: Track cooldowns {asset_id: timestamp_of_exit}
+        self.cooldowns = {}
 
         self._init_csv()
         self._restore_history()
@@ -204,12 +221,10 @@ class SimulatedTrader:
                 reader = csv.DictReader(f)
                 rows = list(reader)
 
-            # Reset state variables to base values, then replay history
             self.balance = 1000.0
             self.positions = []
             self.realized_pnl = 0.0
 
-            # Temporary dict to track active position objects by asset_id
             active_positions = {}
 
             for row in rows:
@@ -217,17 +232,14 @@ class SimulatedTrader:
                 aid = row['asset_id']
                 side = row['side']
 
-                # Safe parsing
                 try:
                     price = float(row['price']) if row['price'] else 0.0
                     qty = float(row['quantity']) if row['quantity'] else 0.0
                     cost = float(row['cost']) if row['cost'] else 0.0
-                    # pnl might be empty string for BUY rows
                     pnl = float(row['pnl']) if row['pnl'] and row['pnl'].strip() else 0.0
                 except ValueError:
                     continue
 
-                # Timestamp parsing
                 ts_str = row['timestamp']
                 try:
                     dt = datetime.fromisoformat(ts_str)
@@ -237,9 +249,7 @@ class SimulatedTrader:
 
                 if action == 'BUY':
                     self.balance -= cost
-
                     if aid not in active_positions:
-                        # Attempt to find strike from data manager if loaded
                         strike = self.dm.strikes.get(aid, 0.0)
                         pos = Position(aid, side, strike, 0.0)
                         pos.start_ts = ts
@@ -251,33 +261,23 @@ class SimulatedTrader:
                     if pos.size_qty > 0:
                         pos.avg_entry_px = pos.cost_basis / pos.size_qty
                     pos.last_fill_ts = ts
-                    # Don't assume accumulating on restart to avoid immediate double-buys
                     pos.is_accumulating = False
 
                 elif action in ['SELL', 'LIQ', 'TAKE-PROFIT', 'THESIS-BROKEN', 'MODEL-ARB-EXIT']:
-                    # Reconstruct Revenue: For SELL, we sold qty at price.
                     revenue = qty * price
                     self.balance += revenue
                     self.realized_pnl += pnl
-
-                    # Remove position (Sim assumes full exit on sell signal)
                     if aid in active_positions:
                         del active_positions[aid]
 
                 elif action == 'SETTLE':
-                    # Reconstruct Payout: For SETTLE, price is usually the payout scalar (0 or 1)
-                    # Total payout = qty * price
                     total_payout = qty * price
                     self.balance += total_payout
                     self.realized_pnl += pnl
-
                     if aid in active_positions:
                         del active_positions[aid]
 
-            # Finalize positions list
             self.positions = list(active_positions.values())
-
-            # Log results
             self.log(f"Restored {len(self.positions)} active positions.", style="green")
             self.log(f"Restored Bal: ${self.balance:.2f} | R.PnL: ${self.realized_pnl:.2f}", style="green")
 
@@ -315,7 +315,7 @@ class SimulatedTrader:
     def _format_duration(self, start_ts):
         diff = time.time() - start_ts
         if diff < 60: return f"{int(diff)}s"
-        return f"{int(diff/60)}m"
+        return f"{int(diff / 60)}m"
 
     def _settle_position(self, pos, final_price_yes, q_text):
         outcome = 1.0 if final_price_yes >= 0.50 else 0.0
@@ -353,8 +353,8 @@ class SimulatedTrader:
                 self._settle_position(pos, mid, meta['question'])
             return
         if pos and market_bid <= 0.02:
-            # Optional: Log it once so you know it's working (uses self.log)
             return
+
         time_ratio = rem_ms / meta['initial_duration_ms']
         underlying = meta['underlying']
         spot = self.dm.spot_prices.get(underlying)
@@ -370,11 +370,22 @@ class SimulatedTrader:
                 if (time.time() - pos.last_fill_ts) >= CHUNK_DELAY:
                     valid = (pos.side == "YES" and yes_edge > MIN_EDGE)
                     price = market_ask
-                    if valid: self._execute_chunk(pos, price, meta['question'])
-                    else: pos.is_accumulating = False
+                    if valid:
+                        self._execute_chunk(pos, price, meta['question'])
+                    else:
+                        pos.is_accumulating = False
             else:
                 self._check_exit(pos, model_p, market_bid, market_ask, meta['question'])
         else:
+            # Check Cooldown
+            if aid in self.cooldowns:
+                if (time.time() - self.cooldowns[aid]) < COOLDOWN_DURATION:
+                    # Still in cooldown
+                    return
+                else:
+                    # Cooldown expired
+                    del self.cooldowns[aid]
+
             if time_ratio > LIQUIDATION_THRESH:
                 q_text = meta['question']
                 if yes_edge > MIN_EDGE:
@@ -390,7 +401,8 @@ class SimulatedTrader:
         remaining = pos.target_cost - pos.cost_basis
         chunk = min(remaining, MAX_POS_SIZE * CHUNK_PCT, self.balance)
         if chunk < 1.0:
-            pos.is_accumulating = False; return
+            pos.is_accumulating = False;
+            return
 
         price = float(price + SLIPPAGE)
         qty = chunk / price
@@ -424,9 +436,11 @@ class SimulatedTrader:
             elif roi >= 0.10:
                 should_close = True
                 msg_type = "TAKE-PROFIT"
-            elif model_p < (pos.avg_entry_px - THESIS_TOLERANCE):
-                should_close = True
-                msg_type = "THESIS-BROKEN"
+            # elif model_p < (pos.avg_entry_px - THESIS_TOLERANCE):
+            #    should_close = True
+            #    msg_type = "THESIS-BROKEN"
+            # Start cooldown for this asset
+            #   self.cooldowns[pos.asset_id] = time.time()
 
         if should_close:
             self.balance += (pos.size_qty * exit_px)
@@ -435,13 +449,17 @@ class SimulatedTrader:
 
             color = "green" if pnl > 0 else "red"
             dur = self._format_duration(pos.start_ts)
+
+            extra_msg = f" | CD: {int(COOLDOWN_DURATION)}s" if msg_type == "THESIS-BROKEN" else ""
+
             log_msg = (
                 f"{msg_type} {pos.side} | {q_text}\n"
                 f"   >> Exit: {exit_px:.3f} | Entry: {pos.avg_entry_px:.3f} | Qty: {pos.size_qty:.1f}\n"
-                f"   >> Fair: {model_p:.3f} | Held: {dur} | PnL: ${pnl:.2f}"
+                f"   >> Fair: {model_p:.3f} | Held: {dur} | PnL: ${pnl:.2f}{extra_msg}"
             )
             self.log(log_msg, style=f"bold {color}")
             self._save_trade("SELL", pos, exit_px, pos.size_qty, pos.cost_basis, pnl, msg_type, q_text)
+
 
 # ==============================================================================
 # 3. UNIFIED UI GENERATION
@@ -457,6 +475,7 @@ def format_time_left(ms, initial_ms):
     txt = f"{h}h {m}m"
     if h == 0 and m < 10: txt = f"{m}m {s}s"
     return f"{style_tag}{txt}{end_tag}"
+
 
 def get_unified_rows(trader):
     rows = []
@@ -488,7 +507,8 @@ def get_unified_rows(trader):
                 edge_yes = model_p - mkt_ask
                 edge_no = mkt_bid - model_p
                 edge_val = edge_yes if edge_yes > edge_no else edge_no
-            except: pass
+            except:
+                pass
 
         pos_str = "-"
         entry_str = "-"
@@ -503,12 +523,19 @@ def get_unified_rows(trader):
             unreal_pnl = val - pos.cost_basis
             p_color = "green" if unreal_pnl >= 0 else "red"
             pnl_str = f"[{p_color}]{unreal_pnl:+.2f}[/]"
-            side_c = "green" if pos.side=="YES" else "red"
+            side_c = "green" if pos.side == "YES" else "red"
             pos_str = f"[{side_c}]{pos.side}[/] ({int(pos.size_qty)})"
             entry_str = f"{pos.avg_entry_px:.3f}"
 
-        if pos is None and abs(edge_val) < 0.005 and rem_ms > 3600000:
+        # Check cooldown state
+        is_cooling = aid in trader.cooldowns
+
+        if pos is None and not is_cooling and abs(edge_val) < 0.005 and rem_ms > 3600000:
             continue
+
+        if is_cooling:
+            row_style = "dim"
+            pos_str = f"[blue]CD {int(COOLDOWN_DURATION - (time.time() - trader.cooldowns[aid]))}s[/]"
 
         e_color = "green" if edge_val > 0 else "red"
         edge_str = f"[{e_color}]{edge_val:+.3f}[/]" if model_p > 0 else "-"
@@ -531,6 +558,7 @@ def get_unified_rows(trader):
 
     rows.sort(key=lambda x: x['time_ms'])
     return rows
+
 
 def make_layout(trader):
     layout = Layout()
@@ -571,7 +599,7 @@ def make_layout(trader):
     stats.add_column(justify="center", ratio=1)
     stats.add_column(justify="center", ratio=1)
 
-    spot_txt = " | ".join([f"{k} ${v:3f}" for k,v in trader.dm.spot_prices.items()])
+    spot_txt = " | ".join([f"{k} ${v:3f}" for k, v in trader.dm.spot_prices.items()])
 
     stats.add_row(
         f"[bold]Total Value: ${total_account_value:.2f}[/]  |  [bold {pnl_color}]Net PnL: ${total_pnl:+.2f}[/]",
@@ -620,6 +648,7 @@ def make_layout(trader):
 
     return layout
 
+
 # ==============================================================================
 # 4. ASYNC LOOP
 # ==============================================================================
@@ -644,6 +673,7 @@ async def zmq_loop(trader):
         except Exception:
             await asyncio.sleep(0.1)
 
+
 async def main():
     dm = DataManager()
     dm._load_sync()
@@ -658,6 +688,7 @@ async def main():
         while True:
             live.update(make_layout(trader))
             await asyncio.sleep(0.25)
+
 
 if __name__ == "__main__":
     try:

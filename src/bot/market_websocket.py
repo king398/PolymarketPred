@@ -98,7 +98,7 @@ async def tcp_server(b: Broadcaster) -> None:
 async def stream_binance(b: Broadcaster) -> None:
     """Streams BTC and ETH Book Tickers from Binance Spot."""
     # Spot combined stream URL format: /stream?streams=btcusdt@bookTicker/ethusdt@bookTicker
-    spot_url = "wss://stream.binance.com:9443/stream?streams=btcusdt@bookTicker/ethusdt@bookTicker/solusdt@bookticker/xrpusdt@bookTicker"
+    spot_url = "wss://stream.binance.com:9443/stream?streams=btcusdt@bookTicker/ethusdt@bookTicker/solusdt@bookTicker/xrpusdt@bookTicker"
 
     while True:
         try:
