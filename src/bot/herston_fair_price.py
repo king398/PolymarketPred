@@ -43,7 +43,7 @@ ZMQ_ADDR = "tcp://127.0.0.1:5567"
 BINANCE_API = "https://api.binance.com/api/v3/ticker/price"
 
 # File Paths
-DATA_DIR = "/home/mithil/PycharmProjects/PolymarketPred/data"
+DATA_DIR = "/home/ubuntu/PolymarketPred/data"
 ASSET_ID_FILE = os.path.join(DATA_DIR, "clob_token_ids.jsonl")
 PARAMS_FILE = os.path.join(DATA_DIR, "bates_params_digital.jsonl")
 STRIKES_FILE = os.path.join(DATA_DIR, "market_1m_candle_opens.jsonl")

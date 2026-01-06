@@ -18,7 +18,7 @@ json_lib = orjson
 # --- CONFIG ---
 POLY_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 BINANCE_WS_URL = "wss://fstream.binance.com/ws"  # USDS-M Futures
-ASSET_ID_FILE = "/home/mithil/PycharmProjects/PolymarketPred/data/clob_token_ids.jsonl"
+ASSET_ID_FILE = "/home/ubuntu/PolymarketPred/data/clob_token_ids.jsonl"
 BIND_HOST = "127.0.0.1"
 BIND_PORT = 9000
 FILE_CHECK_INTERVAL = 60
