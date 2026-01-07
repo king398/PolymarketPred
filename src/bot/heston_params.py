@@ -166,8 +166,7 @@ class HestonCalibrator:
 
             err = 0.0
             for i, k_val in enumerate(K):
-                model_val = FastHestonModel.price_binary_call(1.0, float(k_val), float(T), list(p))
-
+                model_val = FastHestonModel.price_binary_call(1.0, float(k_val), float(T), float(T), list(p))
                 # Weight ATM more heavily
                 w = np.exp(-((k_val - 1.0) / 0.15) ** 2)
                 diff = model_val - D_mkt[i]

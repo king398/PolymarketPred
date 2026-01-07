@@ -1,14 +1,10 @@
 """
 BATES-MODEL VALUE ARBITRAGE SIM (Polymarket Up/Down)
-- DETAILED LOGS: Full trade lifecycle (Entry/Exit px, Qty, Duration).
-- FULL TEXT: Questions wrap instead of truncate.
-- AUTO-CLEAN: Expired markets are hidden from the scanner.
+- DETAILED LOGS: Multi-line logs with Spot, Strike, Model Price, Edge, ROI, Duration.
+- DYNAMIC EDGE: Requires larger margin of safety for cheap options (Anti-Theta).
 - UNIFIED UI: Single table for scanner & portfolio.
-- NEW EXIT: Failsafe exit if Fair Price < Entry Price.
-- TRADE HISTORY: Saves all actions to CSV.
-- PORTFOLIO STATS: Tracks Invested Cash, Realized PnL & Total Portfolio Value.
-- STATE RESTORE: Reloads positions and balance from CSV on restart.
-- COOLDOWN: Enforces 60s wait after thesis break before re-entry.
+- FAILSAFE EXIT: Hysteresis added to stop whipsaw exits.
+- STATE RESTORE: Reloads positions from CSV.
 """
 
 import time
@@ -25,8 +21,6 @@ from collections import deque
 from datetime import datetime
 from layout import make_layout
 from rich.live import Live
-# --- RICH IMPORTS ---
-
 
 # --- MODEL IMPORT ---
 from heston_model import FastHestonModel
@@ -38,24 +32,23 @@ ZMQ_ADDR = "tcp://127.0.0.1:5567"
 BINANCE_API = "https://api.binance.com/api/v3/ticker/price"
 
 # File Paths
-# Change this to use the current directory or a relative path
 DATA_DIR = os.path.join(os.getcwd(), "data")
-# OR ensure the folder /home/ubuntu/PolymarketPred/data actually exists and contains files.
 ASSET_ID_FILE = os.path.join(DATA_DIR, "clob_token_ids.jsonl")
 PARAMS_FILE = os.path.join(DATA_DIR, "bates_params_digital.jsonl")
 STRIKES_FILE = os.path.join(DATA_DIR, "market_1m_candle_opens.jsonl")
 TRADES_LOG_FILE = os.path.join(DATA_DIR, "sim_trade_history.csv")
 
 # Strategy Parameters
-MIN_EDGE = 0.02
+BASE_MIN_EDGE = 0.02       # Standard edge for ITM/ATM
+HIGH_CONVICTION_EDGE = 0.05 # Higher edge for OTM (Cheap) options
 MAX_POS_SIZE = 50.0
 SLIPPAGE = 0.0002
-LIQUIDATION_THRESH = 0.10  # 10% time remaining
-COOLDOWN_DURATION = 60.0  # Seconds to wait after thesis break
+LIQUIDATION_THRESH = 0.10
+COOLDOWN_DURATION = 60.0
+MAX_SPREAD = 0.10
 
 # Risk Management
 THESIS_TOLERANCE = 0.05
-# Execution Parameters
 CHUNK_PCT = 0.5
 CHUNK_DELAY = 2.0
 
@@ -74,7 +67,7 @@ tick_dtype = np.dtype([
     ("ask", np.float32),
 ])
 
-state_ticks = {}  # Global ticker store
+state_ticks = {}
 
 
 # ==============================================================================
@@ -128,9 +121,7 @@ class DataManager:
                         if underlying and m.get('clob_token_id'):
                             cat = m.get('category', '1h')
                             dt = datetime.fromisoformat(m['market_end'].replace('Z', '+00:00'))
-
                             t_years = DURATION_MAP.get(cat, HOUR_1)
-
                             self.clob_map[m['clob_token_id']] = {
                                 "question": m.get('question', m.get('slug')),
                                 "underlying": underlying,
@@ -169,12 +160,9 @@ class Position:
         self.side = side
         self.strike = strike
         self.initial_model_prob = model_prob
-
         self.avg_entry_px = 0.0
         self.size_qty = 0.0
         self.cost_basis = 0.0
-
-        # Tracking for logs
         self.start_ts = time.time()
         self.target_cost = MAX_POS_SIZE
         self.last_fill_ts = 0
@@ -184,14 +172,11 @@ class Position:
 class SimulatedTrader:
     def __init__(self, data_manager: DataManager):
         self.dm = data_manager
-        self.balance = 1000.0
+        self.balance = 2000.0
         self.positions = []
         self.realized_pnl = 0.0
         self.logs = deque(maxlen=10)
-
-        # New: Track cooldowns {asset_id: timestamp_of_exit}
         self.cooldowns = {}
-
         self._init_csv()
         self._restore_history()
 
@@ -200,109 +185,58 @@ class SimulatedTrader:
             try:
                 with open(TRADES_LOG_FILE, mode='w', newline='', encoding='utf-8') as f:
                     writer = csv.writer(f)
-                    writer.writerow([
-                        "timestamp", "action", "question", "asset_id", "side",
-                        "price", "quantity", "cost", "pnl", "reason"
-                    ])
+                    writer.writerow(["timestamp", "action", "question", "asset_id", "side", "price", "quantity", "cost", "pnl", "reason"])
             except Exception as e:
                 self.log(f"CSV Init Error: {e}", style="red")
 
     def _restore_history(self):
-        """Reconstructs state from the CSV log."""
-        if not os.path.exists(TRADES_LOG_FILE):
-            return
-
+        if not os.path.exists(TRADES_LOG_FILE): return
         self.log("Restoring history from CSV...", style="bold yellow")
         try:
             with open(TRADES_LOG_FILE, mode='r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
-                rows = list(reader)
+                active_positions = {}
+                for row in reader:
+                    action = row['action']
+                    aid = row['asset_id']
+                    side = row['side']
+                    try:
+                        price = float(row['price']) if row['price'] else 0.0
+                        qty = float(row['quantity']) if row['quantity'] else 0.0
+                        cost = float(row['cost']) if row['cost'] else 0.0
+                        pnl = float(row['pnl']) if row['pnl'] else 0.0
+                    except: continue
 
-            self.balance = 1000.0
-            self.positions = []
-            self.realized_pnl = 0.0
-
-            active_positions = {}
-
-            for row in rows:
-                action = row['action']
-                aid = row['asset_id']
-                side = row['side']
-
-                try:
-                    price = float(row['price']) if row['price'] else 0.0
-                    qty = float(row['quantity']) if row['quantity'] else 0.0
-                    cost = float(row['cost']) if row['cost'] else 0.0
-                    pnl = float(row['pnl']) if row['pnl'] and row['pnl'].strip() else 0.0
-                except ValueError:
-                    continue
-
-                ts_str = row['timestamp']
-                try:
-                    dt = datetime.fromisoformat(ts_str)
-                    ts = dt.timestamp()
-                except:
-                    ts = time.time()
-
-                if action == 'BUY':
-                    self.balance -= cost
-                    if aid not in active_positions:
-                        strike = self.dm.strikes.get(aid, 0.0)
-                        pos = Position(aid, side, strike, 0.0)
-                        pos.start_ts = ts
-                        active_positions[aid] = pos
-
-                    pos = active_positions[aid]
-                    pos.cost_basis += cost
-                    pos.size_qty += qty
-                    if pos.size_qty > 0:
-                        pos.avg_entry_px = pos.cost_basis / pos.size_qty
-                    pos.last_fill_ts = ts
-                    pos.is_accumulating = False
-
-                elif action in ['SELL', 'LIQ', 'TAKE-PROFIT', 'THESIS-BROKEN', 'MODEL-ARB-EXIT']:
-                    revenue = qty * price
-                    self.balance += revenue
-                    self.realized_pnl += pnl
-                    if aid in active_positions:
-                        del active_positions[aid]
-
-                elif action == 'SETTLE':
-                    total_payout = qty * price
-                    self.balance += total_payout
-                    self.realized_pnl += pnl
-                    if aid in active_positions:
-                        del active_positions[aid]
-
-            self.positions = list(active_positions.values())
-            self.log(f"Restored {len(self.positions)} active positions.", style="green")
-            self.log(f"Restored Bal: ${self.balance:.2f} | R.PnL: ${self.realized_pnl:.2f}", style="green")
-
+                    if action == 'BUY':
+                        self.balance -= cost
+                        if aid not in active_positions:
+                            strike = self.dm.strikes.get(aid, 0.0)
+                            active_positions[aid] = Position(aid, side, strike, 0.0)
+                        pos = active_positions[aid]
+                        pos.cost_basis += cost
+                        pos.size_qty += qty
+                        if pos.size_qty > 0: pos.avg_entry_px = pos.cost_basis / pos.size_qty
+                        pos.is_accumulating = False
+                    elif action in ['SELL', 'LIQ', 'TAKE-PROFIT', 'STOP-LOSS', 'THESIS-BROKEN', 'MODEL-ARB-EXIT']:
+                        self.balance += (qty * price)
+                        self.realized_pnl += pnl
+                        if aid in active_positions: del active_positions[aid]
+                    elif action == 'SETTLE':
+                        self.balance += (qty * price)
+                        self.realized_pnl += pnl
+                        if aid in active_positions: del active_positions[aid]
+                self.positions = list(active_positions.values())
         except Exception as e:
-            self.log(f"Error restoring history: {e}", style="red")
+            self.log(f"Error restoring: {e}", style="red")
 
     def _save_trade(self, action, pos, price, qty, cost, pnl, reason, question):
         try:
             with open(TRADES_LOG_FILE, mode='a', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    datetime.now().isoformat(),
-                    action,
-                    question,
-                    pos.asset_id,
-                    pos.side,
-                    f"{price:.4f}",
-                    f"{qty:.4f}",
-                    f"{cost:.4f}",
-                    f"{pnl:.4f}" if pnl is not None else "",
-                    reason
-                ])
-        except Exception as e:
-            self.log(f"CSV Save Error: {e}", style="red")
+                csv.writer(f).writerow([datetime.now().isoformat(), action, question, pos.asset_id, pos.side, f"{price:.4f}", f"{qty:.4f}", f"{cost:.4f}", f"{pnl:.4f}" if pnl is not None else "", reason])
+        except: pass
 
     def log(self, msg, style="white"):
-        ts = time.strftime("%H:%M:%S")
-        self.logs.append((ts, msg, style))
+        self.logs.append((time.strftime("%H:%M:%S"), msg, style))
 
     def get_position(self, aid):
         for p in self.positions:
@@ -311,28 +245,25 @@ class SimulatedTrader:
 
     def _format_duration(self, start_ts):
         diff = time.time() - start_ts
-        if diff < 60: return f"{int(diff)}s"
-        return f"{int(diff / 60)}m"
+        return f"{int(diff)}s" if diff < 60 else f"{int(diff/60)}m"
 
     def _settle_position(self, pos, final_price_yes, q_text):
         outcome = 1.0 if final_price_yes >= 0.50 else 0.0
-        payout_val = outcome if pos.side == "YES" else (1.0 - outcome)
-        total_payout = pos.size_qty * payout_val
-        pnl = total_payout - pos.cost_basis
-
-        self.balance += total_payout
+        payout = pos.size_qty * outcome
+        pnl = payout - pos.cost_basis
+        self.balance += payout
         self.realized_pnl += pnl
 
         color = "green" if pnl >= 0 else "red"
         dur = self._format_duration(pos.start_ts)
 
-        log_msg = (
-            f"SETTLED {pos.side} | {q_text}\n"
-            f"   >> Exit: {outcome:.0f} | Entry: {pos.avg_entry_px:.3f} | Qty: {pos.size_qty:.1f}\n"
-            f"   >> Held: {dur} | PnL: ${pnl:.2f}"
-        )
-        self.log(log_msg, style=f"bold {color}")
-        self._save_trade("SETTLE", pos, payout_val, pos.size_qty, pos.cost_basis, pnl, "EXPIRATION", q_text)
+        # DETAILED SETTLE LOG
+        msg = (f"[SETTLE] {pos.side} | {q_text}\n"
+               f"   >> Outcome: {outcome:.0f} | Entry: {pos.avg_entry_px:.3f} | ROI: {(pnl/pos.cost_basis)*100:.1f}%\n"
+               f"   >> PnL: ${pnl:.2f} | Held: {dur}")
+
+        self.log(msg, style=f"bold {color}")
+        self._save_trade("SETTLE", pos, outcome, pos.size_qty, pos.cost_basis, pnl, "EXPIRATION", q_text)
         self.positions.remove(pos)
 
     def evaluate(self, aid, market_bid, market_ask):
@@ -343,63 +274,60 @@ class SimulatedTrader:
         now_ms = int(time.time() * 1000)
         rem_ms = meta['end_ts_ms'] - now_ms
         pos = self.get_position(aid)
+        spread = market_ask - market_bid
 
         if rem_ms <= 0:
-            if pos:
-                mid = (market_bid + market_ask) / 2.0
-                self._settle_position(pos, mid, meta['question'])
-            return
-        if pos and market_bid <= 0.02:
+            if pos: self._settle_position(pos, (market_bid+market_ask)/2, meta['question'])
             return
 
-        time_ratio = rem_ms / meta['initial_duration_ms']
-        underlying = meta['underlying']
-        spot = self.dm.spot_prices.get(underlying)
-        params = self.dm.bates_params.get(underlying)
+        if pos and market_bid <= 0.02: return # Dead market protection
+
+        spot = self.dm.spot_prices.get(meta['underlying'])
+        params = self.dm.bates_params.get(meta['underlying'])
         if not (spot and params): return
 
         T_years = rem_ms / (1000 * 365 * 24 * 3600.0)
+        t_days = rem_ms / (1000 * 3600 * 24.0)
         model_p = FastHestonModel.price_binary_call(spot, strike, T_years, meta['initial_T'], params)
         yes_edge = model_p - market_ask
+
+        # --- DYNAMIC EDGE CALCULATION ---
+        required_edge = HIGH_CONVICTION_EDGE if market_ask < 0.40 else BASE_MIN_EDGE
 
         if pos:
             if pos.is_accumulating:
                 if (time.time() - pos.last_fill_ts) >= CHUNK_DELAY:
-                    valid = (pos.side == "YES" and yes_edge > MIN_EDGE)
-                    price = market_ask
-                    if valid:
-                        self._execute_chunk(pos, price, meta['question'])
+                    if spread > MAX_SPREAD: return
+                    if pos.side == "YES" and yes_edge > required_edge:
+                        # PASS DETAILED INFO TO EXECUTE
+                        self._execute_chunk(pos, market_ask, meta['question'], model_p, spot, yes_edge, t_days)
                     else:
                         pos.is_accumulating = False
             else:
-                self._check_exit(pos, model_p, market_bid, market_ask, meta['question'])
+                self._check_exit(pos, model_p, market_bid, market_ask, meta['question'], t_days)
         else:
-            # Check Cooldown
             if aid in self.cooldowns:
-                if (time.time() - self.cooldowns[aid]) < COOLDOWN_DURATION:
-                    # Still in cooldown
-                    return
-                else:
-                    # Cooldown expired
-                    del self.cooldowns[aid]
+                if (time.time() - self.cooldowns[aid]) < COOLDOWN_DURATION: return
+                else: del self.cooldowns[aid]
 
-            if time_ratio > LIQUIDATION_THRESH:
-                q_text = meta['question']
-                if yes_edge > MIN_EDGE:
-                    self._start_position(aid, "YES", market_ask, model_p, strike, q_text)
+            if spread > MAX_SPREAD: return
 
-    def _start_position(self, aid, side, price, model_p, strike, q_text):
+            if (rem_ms/meta['initial_duration_ms']) > LIQUIDATION_THRESH:
+                if yes_edge > required_edge:
+                    # PASS DETAILED INFO TO START
+                    self._start_position(aid, "YES", market_ask, model_p, strike, meta['question'], spot, yes_edge, t_days)
+
+    def _start_position(self, aid, side, price, model_p, strike, q_text, spot, edge, t_days):
         if price <= 0.15 or price >= 0.95: return
         pos = Position(aid, side, strike, model_p)
         self.positions.append(pos)
-        self._execute_chunk(pos, price, q_text)
+        self._execute_chunk(pos, price, q_text, model_p, spot, edge, t_days)
 
-    def _execute_chunk(self, pos, price, q_text):
+    def _execute_chunk(self, pos, price, q_text, model_p, spot, edge, t_days):
         remaining = pos.target_cost - pos.cost_basis
         chunk = min(remaining, MAX_POS_SIZE * CHUNK_PCT, self.balance)
         if chunk < 1.0:
-            pos.is_accumulating = False;
-            return
+            pos.is_accumulating = False; return
 
         price = float(price + SLIPPAGE)
         qty = chunk / price
@@ -409,54 +337,47 @@ class SimulatedTrader:
         pos.avg_entry_px = pos.cost_basis / pos.size_qty
         pos.last_fill_ts = time.time()
 
-        color = "green"
-        msg = f"BUY {pos.side} | {q_text} @ {price:.3f} (Qty: {qty:.1f})"
-        self.log(msg, style=f"dim {color}")
+        # DETAILED BUY LOG
+        msg = (f"[BUY] {pos.side} | {q_text}\n"
+               f"   >> Px: {price:.3f} | Fair: {model_p:.3f} | Edge: {edge:.3f}\n"
+               f"   >> Spot: ${spot:,.2f} | Strike: {pos.strike:,.0f} | Exp: {t_days:.1f}d")
+
+        self.log(msg, style="dim green")
         self._save_trade("BUY", pos, price, qty, chunk, None, "ENTRY_CHUNK", q_text)
+        if pos.cost_basis >= pos.target_cost * 0.99: pos.is_accumulating = False
 
-        if pos.cost_basis >= pos.target_cost * 0.99:
-            pos.is_accumulating = False
-
-    def _check_exit(self, pos, model_p, bid, ask, q_text, force=False):
+    def _check_exit(self, pos, model_p, bid, ask, q_text, t_days, force=False):
         exit_px = bid - SLIPPAGE
-
         pnl = (pos.size_qty * exit_px) - pos.cost_basis
         roi = pnl / max(pos.cost_basis, 1e-6)
-
         should_close = force
         msg_type = "LIQ" if force else "CLOSE"
 
         if not force:
-            if pos.side == "YES" and model_p < bid:
-                should_close = True
-                msg_type = "MODEL-ARB-EXIT"
-            elif roi >= 0.10:
+            # Take Profit
+            if roi >= 0.10:
                 should_close = True
                 msg_type = "TAKE-PROFIT"
-            # elif model_p < (pos.avg_entry_px - THESIS_TOLERANCE):
-            #    should_close = True
-            #    msg_type = "THESIS-BROKEN"
-            # Start cooldown for this asset
-            #   self.cooldowns[pos.asset_id] = time.time()
+
+            # Model Exit with Hysteresis
+            elif pos.side == "YES" and model_p < (bid - 0.05):
+                should_close = True
+                msg_type = "MODEL-ARB-EXIT"
 
         if should_close:
             self.balance += (pos.size_qty * exit_px)
             self.realized_pnl += pnl
             self.positions.remove(pos)
-
             color = "green" if pnl > 0 else "red"
             dur = self._format_duration(pos.start_ts)
 
-            extra_msg = f" | CD: {int(COOLDOWN_DURATION)}s" if msg_type == "THESIS-BROKEN" else ""
+            # DETAILED EXIT LOG
+            msg = (f"[{msg_type}] {pos.side} | {q_text}\n"
+                   f"   >> Exit: {exit_px:.3f} | Entry: {pos.avg_entry_px:.3f} | ROI: {roi*100:.1f}%\n"
+                   f"   >> Fair: {model_p:.3f} | PnL: ${pnl:.2f} | Held: {dur}")
 
-            log_msg = (
-                f"{msg_type} {pos.side} | {q_text}\n"
-                f"   >> Exit: {exit_px:.3f} | Entry: {pos.avg_entry_px:.3f} | Qty: {pos.size_qty:.1f}\n"
-                f"   >> Fair: {model_p:.3f} | Held: {dur} | PnL: ${pnl:.2f}{extra_msg}"
-            )
-            self.log(log_msg, style=f"bold {color}")
+            self.log(msg, style=f"bold {color}")
             self._save_trade("SELL", pos, exit_px, pos.size_qty, pos.cost_basis, pnl, msg_type, q_text)
-
 
 # ==============================================================================
 # 4. ASYNC LOOP
@@ -466,41 +387,27 @@ async def zmq_loop(trader):
     sub = ctx.socket(zmq.SUB)
     sub.connect(ZMQ_ADDR)
     sub.subscribe(b"")
-
     while True:
         try:
-            aid_bytes, payload = await sub.recv_multipart()
-            aid = aid_bytes.decode()
+            aid, payload = await sub.recv_multipart()
             arr = np.frombuffer(payload, dtype=tick_dtype)
-            state_ticks[aid] = arr
-
-            if len(arr) > 0:
-                bid = float(arr['bid'][-1])
-                ask = float(arr['ask'][-1])
-                trader.evaluate(aid, bid, ask)
-                # print(f"Processed {aid} | Bid: {bid:.3f} | Ask: {ask:.3f}")
-        except Exception:
-            await asyncio.sleep(0.1)
-
+            state_ticks[aid.decode()] = arr
+            if len(arr) > 0: trader.evaluate(aid.decode(), float(arr['bid'][-1]), float(arr['ask'][-1]))
+        except: await asyncio.sleep(0.1)
 
 async def main():
     dm = DataManager()
     dm._load_sync()
     print("Initializing Unified Bates Model Sim...")
     trader = SimulatedTrader(dm)
-
     asyncio.create_task(dm.update_spot_prices())
     asyncio.create_task(zmq_loop(trader))
     asyncio.create_task(dm.watch_metadata())
-
     with Live(make_layout(trader, state_ticks), refresh_per_second=4, screen=True) as live:
         while True:
             live.update(make_layout(trader, state_ticks))
             await asyncio.sleep(0.25)
 
-
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    try: asyncio.run(main())
+    except KeyboardInterrupt: pass

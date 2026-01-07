@@ -116,7 +116,7 @@ def get_unified_rows(trader, state_ticks):
         rem_ms = meta['end_ts_ms'] - now_ms
         pos = pos_map.get(aid)
 
-        if rem_ms < 0 or pos is None:
+        if rem_ms < 0 and pos is None:
             continue
 
         model_p = 0.0
