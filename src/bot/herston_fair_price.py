@@ -2,6 +2,7 @@
 BATES-MODEL VALUE ARBITRAGE SIM (Polymarket Up/Down)
 - DETAILED LOGS: Multi-line logs with Spot, Strike, Model Price, Edge, ROI, Duration.
 - DYNAMIC EDGE: Requires larger margin of safety for cheap options (Anti-Theta).
+- VEGA FILTER: Rejects OTM options with low sensitivity to vol (Dynamic threshold).
 - UNIFIED UI: Single table for scanner & portfolio.
 - FAILSAFE EXIT: Hysteresis added to stop whipsaw exits.
 - STATE RESTORE: Reloads positions from CSV.
@@ -23,11 +24,14 @@ from layout import make_layout
 from rich.live import Live
 
 # --- MODEL IMPORT ---
+# Ensure heston_model.py is in the same directory or python path
 from heston_model import FastHestonModel
 
 warnings.filterwarnings("ignore")
 
-# --- CONFIGURATION ---
+# ==============================================================================
+# 0. CONFIGURATION
+# ==============================================================================
 ZMQ_ADDR = "tcp://127.0.0.1:5567"
 BINANCE_API = "https://api.binance.com/api/v3/ticker/price"
 
@@ -46,6 +50,11 @@ SLIPPAGE = 0.0002
 LIQUIDATION_THRESH = 0.10
 COOLDOWN_DURATION = 60.0
 MAX_SPREAD = 0.10
+
+# Vega Filtering (OTM Protection)
+ENABLE_VEGA_FILTER = True
+MIN_VEGA_ATM = 0.05        # Minimum Vega required when Near-the-Money
+VEGA_DIST_SCALER = 3.0     # How much steeper the requirement gets as we go deeper OTM
 
 # Risk Management
 THESIS_TOLERANCE = 0.05
@@ -82,15 +91,16 @@ class DataManager:
         self.symbol_map = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT", "XRP": "XRPUSDT"}
 
     def _load_sync(self):
+        # Load Model Params
         if os.path.exists(PARAMS_FILE):
             with open(PARAMS_FILE, "r") as f:
                 for line in f:
                     try:
                         p = json.loads(line)
                         self.bates_params[p['currency']] = p
-                    except:
-                        pass
+                    except: pass
 
+        # Load Strikes
         if os.path.exists(STRIKES_FILE):
             with open(STRIKES_FILE, "r") as f:
                 for line in f:
@@ -98,9 +108,9 @@ class DataManager:
                         obj = json.loads(line)
                         if "clob_token_id" in obj and "strike_price" in obj:
                             self.strikes[obj["clob_token_id"]] = float(obj["strike_price"])
-                    except:
-                        pass
+                    except: pass
 
+        # Load Metadata (CLOB IDs)
         if os.path.exists(ASSET_ID_FILE):
             with open(ASSET_ID_FILE, "r") as f:
                 for line in f:
@@ -109,14 +119,10 @@ class DataManager:
                         m = json.loads(line)
                         slug = m.get('slug', '').lower()
                         underlying = None
-                        if 'bitcoin' in slug or 'btc' in slug:
-                            underlying = "BTC"
-                        elif 'ethereum' in slug or 'eth' in slug:
-                            underlying = "ETH"
-                        elif 'solana' in slug or 'sol' in slug:
-                            underlying = "SOL"
-                        elif 'xrp' in slug:
-                            underlying = "XRP"
+                        if 'bitcoin' in slug or 'btc' in slug: underlying = "BTC"
+                        elif 'ethereum' in slug or 'eth' in slug: underlying = "ETH"
+                        elif 'solana' in slug or 'sol' in slug: underlying = "SOL"
+                        elif 'xrp' in slug: underlying = "XRP"
 
                         if underlying and m.get('clob_token_id'):
                             cat = m.get('category', '1h')
@@ -129,8 +135,7 @@ class DataManager:
                                 "initial_T": t_years,
                                 "initial_duration_ms": t_years * YEAR_MS
                             }
-                    except:
-                        pass
+                    except: pass
         return len(self.strikes)
 
     async def watch_metadata(self):
@@ -146,8 +151,7 @@ class DataManager:
                     r = requests.get(BINANCE_API, params={"symbol": ticker}, timeout=2)
                     if r.status_code == 200:
                         self.spot_prices[sym] = float(r.json()['price'])
-            except Exception:
-                pass
+            except Exception: pass
             await asyncio.sleep(1.0)
 
 
@@ -256,15 +260,28 @@ class SimulatedTrader:
 
         color = "green" if pnl >= 0 else "red"
         dur = self._format_duration(pos.start_ts)
-
-        # DETAILED SETTLE LOG
         msg = (f"[SETTLE] {pos.side} | {q_text}\n"
-               f"   >> Outcome: {outcome:.0f} | Entry: {pos.avg_entry_px:.3f} | ROI: {(pnl/pos.cost_basis)*100:.1f}%\n"
+               f"   >> Outcome: {outcome:.0f} | Entry: {pos.avg_entry_px:.3f} | ROI: {(pnl/max(pos.cost_basis, 0.01))*100:.1f}%\n"
                f"   >> PnL: ${pnl:.2f} | Held: {dur}")
 
         self.log(msg, style=f"bold {color}")
         self._save_trade("SETTLE", pos, outcome, pos.size_qty, pos.cost_basis, pnl, "EXPIRATION", q_text)
         self.positions.remove(pos)
+
+    def _estimate_heston_vega(self, spot, strike, T_years, init_T, params, base_price):
+        """
+        Calculates Vega via Finite Difference on the Heston v0 (Initial Variance).
+        Returns the change in price per 1% change in Volatility (approx).
+        """
+        try:
+            bump = 0.01
+            p_bump = params.copy()
+            p_bump['v0'] += bump # Increase initial variance
+            new_price = FastHestonModel.price_binary_call(spot, strike, T_years, init_T, p_bump)
+            # Vega = dPrice / dVol
+            return (new_price - base_price) / bump
+        except:
+            return 0.0
 
     def evaluate(self, aid, market_bid, market_ask):
         meta = self.dm.clob_map.get(aid)
@@ -276,11 +293,13 @@ class SimulatedTrader:
         pos = self.get_position(aid)
         spread = market_ask - market_bid
 
+        # Expiration Handling
         if rem_ms <= 0:
             if pos: self._settle_position(pos, (market_bid+market_ask)/2, meta['question'])
             return
 
-        if pos and market_bid <= 0.02: return # Dead market protection
+        # Dead Market Protection
+        if pos and market_bid <= 0.02: return
 
         spot = self.dm.spot_prices.get(meta['underlying'])
         params = self.dm.bates_params.get(meta['underlying'])
@@ -291,21 +310,22 @@ class SimulatedTrader:
         model_p = FastHestonModel.price_binary_call(spot, strike, T_years, meta['initial_T'], params)
         yes_edge = model_p - market_ask
 
-        # --- DYNAMIC EDGE CALCULATION ---
+        # Dynamic Edge Requirement
         required_edge = HIGH_CONVICTION_EDGE if market_ask < 0.40 else BASE_MIN_EDGE
 
         if pos:
+            # Manage Existing Position
             if pos.is_accumulating:
                 if (time.time() - pos.last_fill_ts) >= CHUNK_DELAY:
                     if spread > MAX_SPREAD: return
                     if pos.side == "YES" and yes_edge > required_edge:
-                        # PASS DETAILED INFO TO EXECUTE
                         self._execute_chunk(pos, market_ask, meta['question'], model_p, spot, yes_edge, t_days)
                     else:
                         pos.is_accumulating = False
             else:
                 self._check_exit(pos, model_p, market_bid, market_ask, meta['question'], t_days)
         else:
+            # Check New Entry
             if aid in self.cooldowns:
                 if (time.time() - self.cooldowns[aid]) < COOLDOWN_DURATION: return
                 else: del self.cooldowns[aid]
@@ -313,8 +333,28 @@ class SimulatedTrader:
             if spread > MAX_SPREAD: return
 
             if (rem_ms/meta['initial_duration_ms']) > LIQUIDATION_THRESH:
-                if yes_edge > required_edge:
-                    # PASS DETAILED INFO TO START
+
+                # --- NEW VEGA FILTER LOGIC ---
+                is_otm = spot < strike
+                passed_vega_check = True
+
+                if ENABLE_VEGA_FILTER and is_otm and yes_edge > required_edge:
+                    # 1. Calculate Dist% (How far OTM are we?)
+                    dist_pct = (strike - spot) / spot
+
+                    # 2. Estimate Heston Vega (Sensitivity to v0)
+                    vega = self._estimate_heston_vega(spot, strike, T_years, meta['initial_T'], params, model_p)
+
+                    # 3. Calculate Dynamic Threshold
+                    # Formula: Base + (Slope * Distance)
+                    vega_threshold = MIN_VEGA_ATM + (dist_pct * VEGA_DIST_SCALER)
+
+                    if vega < vega_threshold:
+                        passed_vega_check = False
+                        # Optional: Log rejection
+                        # self.log(f"[FILTER] Low Vega: {vega:.3f} < {vega_threshold:.3f} (OTM: {dist_pct:.1%})", style="dim red")
+
+                if passed_vega_check and yes_edge > required_edge:
                     self._start_position(aid, "YES", market_ask, model_p, strike, meta['question'], spot, yes_edge, t_days)
 
     def _start_position(self, aid, side, price, model_p, strike, q_text, spot, edge, t_days):
@@ -337,7 +377,6 @@ class SimulatedTrader:
         pos.avg_entry_px = pos.cost_basis / pos.size_qty
         pos.last_fill_ts = time.time()
 
-        # DETAILED BUY LOG
         msg = (f"[BUY] {pos.side} | {q_text}\n"
                f"   >> Px: {price:.3f} | Fair: {model_p:.3f} | Edge: {edge:.3f}\n"
                f"   >> Spot: ${spot:,.2f} | Strike: {pos.strike:,.0f} | Exp: {t_days:.1f}d")
@@ -371,7 +410,6 @@ class SimulatedTrader:
             color = "green" if pnl > 0 else "red"
             dur = self._format_duration(pos.start_ts)
 
-            # DETAILED EXIT LOG
             msg = (f"[{msg_type}] {pos.side} | {q_text}\n"
                    f"   >> Exit: {exit_px:.3f} | Entry: {pos.avg_entry_px:.3f} | ROI: {roi*100:.1f}%\n"
                    f"   >> Fair: {model_p:.3f} | PnL: ${pnl:.2f} | Held: {dur}")
@@ -380,7 +418,7 @@ class SimulatedTrader:
             self._save_trade("SELL", pos, exit_px, pos.size_qty, pos.cost_basis, pnl, msg_type, q_text)
 
 # ==============================================================================
-# 4. ASYNC LOOP
+# 3. ASYNC LOOP
 # ==============================================================================
 async def zmq_loop(trader):
     ctx = zmq.asyncio.Context.instance()
@@ -398,7 +436,7 @@ async def zmq_loop(trader):
 async def main():
     dm = DataManager()
     dm._load_sync()
-    print("Initializing Unified Bates Model Sim...")
+    print("Initializing Unified Bates Model Sim with Vega Filter...")
     trader = SimulatedTrader(dm)
     asyncio.create_task(dm.update_spot_prices())
     asyncio.create_task(zmq_loop(trader))
