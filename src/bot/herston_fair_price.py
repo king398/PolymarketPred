@@ -45,20 +45,20 @@ TRADES_LOG_FILE = os.path.join(DATA_DIR, "sim_trade_history.csv")
 # Strategy Parameters
 BASE_MIN_EDGE = 0.02       # Standard edge for ITM/ATM
 HIGH_CONVICTION_EDGE = 0.05 # Higher edge for OTM (Cheap) options
-MAX_POS_SIZE = 50.0
+MAX_POS_SIZE = 100.0
 SLIPPAGE = 0.0002
 LIQUIDATION_THRESH = 0.10
 COOLDOWN_DURATION = 60.0
 MAX_SPREAD = 0.10
 
 # Vega Filtering (OTM Protection)
-ENABLE_VEGA_FILTER = True
+ENABLE_VEGA_FILTER = False
 MIN_VEGA_ATM = 0.05        # Minimum Vega required when Near-the-Money
-VEGA_DIST_SCALER = 3.0     # How much steeper the requirement gets as we go deeper OTM
+VEGA_DIST_SCALER = 3.0
 
 # Risk Management
 THESIS_TOLERANCE = 0.05
-CHUNK_PCT = 0.5
+CHUNK_PCT = 0.2
 CHUNK_DELAY = 2.0
 
 # Time Constants
