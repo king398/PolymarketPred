@@ -52,7 +52,7 @@ COOLDOWN_DURATION = 60.0
 MAX_SPREAD = 0.10
 
 # Vega Filtering (OTM Protection)
-ENABLE_VEGA_FILTER = False
+ENABLE_VEGA_FILTER = True
 MIN_VEGA_ATM = 0.05        # Minimum Vega required when Near-the-Money
 VEGA_DIST_SCALER = 3.0
 
