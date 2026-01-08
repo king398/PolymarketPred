@@ -278,7 +278,6 @@ async def fulfill_market(market_data: Dict, processed_set: set):
         log.error(f"Date parse error {slug}: {e}")
         return
 
-    # 2. Wait logic (UPDATED: Wait until 60s AFTER open)
     wait_ms = start_ms - now_ms()
 
     # We calculate delay including a 60s buffer to ensure candle is closed/ready
@@ -344,15 +343,15 @@ async def discovery_loop(queue: asyncio.Queue, seen_ids: set):
                 new_batch.extend(await process_standard_markets(
                     session, "1h", SYMBOLS_LONG, "1h", 2, "{symbol}-up-or-down-{param}-et"
                 ))
-                new_batch.extend(await process_standard_markets(
+                """new_batch.extend(await process_standard_markets(
                     session, "4h", SYMBOLS_SHORT, "4h", 1, "{symbol}-updown-4h-{param}"
-                ))
+                ))"""
                 new_batch.extend(await process_standard_markets(
                     session, "1d", SYMBOLS_LONG, "1d", 2, "{symbol}-up-or-down-on-{param}"
                 ))
 
                 # 2. Weekly Markets
-                new_batch.extend(await process_weekly_markets(session, 9))
+                #new_batch.extend(await process_weekly_markets(session, 9))
 
                 # 3. Process Batch
                 added_count = 0
