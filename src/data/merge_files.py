@@ -2,7 +2,7 @@ import os
 import glob
 import pandas as pd
 
-CRYPTO_LIST = ['BTH', 'ETH', 'SOL', ]
+CRYPTO_LIST = ['BTC', 'ETH', 'SOL', ]
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, '..', '..'))

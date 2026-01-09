@@ -1,6 +1,5 @@
 # line_profile_talib.py
 import pandas as pd
-import numpy as np
 import talib
 from talib import abstract
 
@@ -26,7 +25,8 @@ def add_all_talib_features(df):
                 r.columns = [f"{func_name}_{col}" for col in r.columns]
                 new_cols.append(r)
 
-        except Exception:
+        except Exception as e:
+            print(f"  [Warning] TALib function {func_name} failed: {e}")
             pass
 
     if new_cols:
