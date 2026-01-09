@@ -51,20 +51,3 @@ class TimeSeriesDataset(Dataset):
             "mean": mean,
             "std": std
         }
-def make_df(n=50_000):
-    close = np.cumsum(np.random.randn(n)) + 100
-    open_ = close + np.random.randn(n) * 0.1
-    high = np.maximum(open_, close) + np.random.rand(n) * 0.2
-    low = np.minimum(open_, close) - np.random.rand(n) * 0.2
-    volume = np.random.randint(100, 10_000, size=n)
-    return pd.DataFrame({"open": open_, "high": high, "low": low, "close": close, "volume": volume})
-
-
-def run():
-    datset = TimeSeriesDataset(make_df(100_000), input_window=60, output_window=5)
-    for i in range(100):
-        x = datset[i]
-
-
-if __name__ == "__main__":
-    run()
