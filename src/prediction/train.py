@@ -19,7 +19,7 @@ warnings.filterwarnings("ignore")
 
 class CFG:
     crypto_name = "BTC"
-    train_start = "2025-12-15 00:00:00"
+    train_start = "2025-12-01 00:00:00"
     train_end = "2025-12-25 23:59:59"
     valid_start = "2025-12-26 00:00:00"
     valid_end = "2025-12-30 23:59:59"

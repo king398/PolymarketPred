@@ -1,21 +1,36 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
+class AttentionBlock(nn.Module):
+    """
+    Computes a weighted sum of LSTM outputs to focus on relevant past time steps.
+    """
+    def __init__(self, hidden_size):
+        super(AttentionBlock, self).__init__()
+        # Learnable weights to calculate relevance score for each time step
+        self.attention_linear = nn.Linear(hidden_size, 1)
+
+    def forward(self, lstm_output):
+        # lstm_output shape: (Batch, Seq_Len, Hidden_Size * 2)
+
+        # 1. Calculate energy scores
+        # shape: (Batch, Seq_Len, 1)
+        energy = torch.tanh(self.attention_linear(lstm_output))
+
+        # 2. Calculate attention weights (probability distribution over time)
+        # shape: (Batch, Seq_Len, 1)
+        weights = F.softmax(energy, dim=1)
+
+        # 3. Calculate Context Vector (Weighted Sum of hidden states)
+        # shape: (Batch, Hidden_Size * 2)
+        context_vector = torch.sum(weights * lstm_output, dim=1)
+
+        return context_vector
 
 class BiLSTMPriceForecast(nn.Module):
     """
-    Bidirectional LSTM forecaster for 1-D target (price).
-
-    Input:
-      x: (B, T, n_features)
-
-    Output:
-      y_hat: (B, z)   # z future steps (e.g., 5 minutes ahead if your step=1 minute and z=5)
-
-    Notes:
-    - Uses a BiLSTM encoder over the past window.
-    - Predicts all z steps "directly" from the encoded representation (no autoregressive decoding),
-      which is usually stable and fast for short horizons like 5 minutes.
+    Bidirectional LSTM with Attention for 1-D target (price).
     """
     def __init__(
             self,
@@ -42,7 +57,12 @@ class BiLSTMPriceForecast(nn.Module):
             bidirectional=True,
         )
 
+        # Dimension of the LSTM output (Forward + Backward)
         rep_dim = hidden_size * self.num_directions
+
+        # --- ADDED: Attention Block ---
+        self.attention = AttentionBlock(rep_dim)
+
         self.norm = nn.LayerNorm(rep_dim) if use_layernorm else nn.Identity()
 
         # MLP head -> z steps of future price
@@ -60,29 +80,17 @@ class BiLSTMPriceForecast(nn.Module):
         """
         if x.dim() != 3:
             raise ValueError(f"x must be (B,T,F). Got {tuple(x.shape)}")
-        B, T, F = x.shape
-        if F != self.n_features:
-            raise ValueError(f"Expected n_features={self.n_features}, got {F}")
 
-        out, (h_n, c_n) = self.lstm(x)
+        # out shape: (B, T, hidden_size * 2)
+        # Contains hidden states for ALL time steps
+        out, _ = self.lstm(x)
 
-        # h_n: (num_layers * 2, B, hidden_size)
-        # Take final-layer hidden states for both directions and concat:
-        # forward = h_n[-2], backward = h_n[-1]
-        h_fwd = h_n[-2]  # (B, hidden)
-        h_bwd = h_n[-1]  # (B, hidden)
-        rep = torch.cat([h_fwd, h_bwd], dim=1)  # (B, hidden*2)
+        # --- CHANGED: Use Attention instead of manual h_n extraction ---
+        # The attention block looks at the whole sequence 'out' and
+        # summarizes it into 'context' based on learned importance.
+        context = self.attention(out)  # (B, hidden*2)
 
-        rep = self.norm(rep)
+        rep = self.norm(context)
         y_hat = self.head(rep)  # (B, z)
+
         return y_hat
-
-
-# --- quick example ---
-if __name__ == "__main__":
-    B, T, n_features = 32, 60, 10  # e.g., last 60 minutes with 10 features
-    z = 5                          # predict next 5 minutes
-    model = BiLSTMPriceForecast(n_features=n_features, hidden_size=128, num_layers=2, z=z)
-    x = torch.randn(B, T, n_features)
-    y = model(x)
-    print(y.shape)  # torch.Size([32, 5])
