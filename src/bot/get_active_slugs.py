@@ -361,6 +361,9 @@ async def discovery_loop(queue: asyncio.Queue, seen_ids: set):
                     session, "4h", SYMBOLS_SHORT, "4h", 1, "{symbol}-updown-4h-{param}"
                 ))
                 new_batch.extend(await process_standard_markets(
+                    session, "15m", SYMBOLS_SHORT, "4h", 1, "{symbol}-updown-15m-{param}"
+                ))
+                new_batch.extend(await process_standard_markets(
                     session, "1d", SYMBOLS_LONG, "1d", 2, "{symbol}-up-or-down-on-{param}"
                 ))
 

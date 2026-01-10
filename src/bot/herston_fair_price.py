@@ -364,7 +364,7 @@ class SimulatedTrader:
                         self._start_position(aid, "YES", market_ask, model_p, strike, meta['question'], spot, yes_edge, t_days)
 
     def _start_position(self, aid, side, price, model_p, strike, q_text, spot, edge, t_days):
-        if price <= 0.10 or price >= 0.95: return
+        if price <= 0.05 or price >= 0.95: return
         pos = Position(aid, side, strike, model_p)
         self.positions.append(pos)
         self._execute_chunk(pos, price, q_text, model_p, spot, edge, t_days)
