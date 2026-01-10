@@ -7,6 +7,7 @@ BATES-MODEL Z-SCORE ARBITRAGE (YES-ONLY)
 - FILTER: Only trades YES. No short selling/NO shares.
 - FIXES: Async loading, ZMQ polling, Non-blocking UI.
 - ADDED: Live Z-Score Dashboard Column.
+- UPDATE: Hides finished/expired markets from the dashboard.
 """
 
 import time
@@ -431,6 +432,12 @@ def make_layout(trader, state_ticks):
 
         meta = trader.dm.clob_map.get(aid)
         if not meta: continue
+
+        # --- FIX: FILTER OUT FINISHED MARKETS ---
+        now_ms = time.time() * 1000
+        if meta['end_ts_ms'] <= now_ms:
+            continue
+        # ----------------------------------------
 
         q_text = meta['question']
         time_rem = format_time_remaining(meta['end_ts_ms'])
