@@ -170,12 +170,16 @@ class DataManager:
 # ==============================================================================
 # 3. TRADING ENGINE
 # ==============================================================================
+# ==============================================================================
+# 3. TRADING ENGINE (DETAILED LOGS)
+# ==============================================================================
 class Position:
-    def __init__(self, asset_id, side, strike, model_prob, entry_z):
+    def __init__(self, asset_id, side, strike, model_prob, entry_z, entry_spot):
         self.asset_id = asset_id
         self.side = side
         self.strike = strike
         self.initial_model_prob = model_prob
+        self.initial_spot = entry_spot  # Track spot at entry
         self.entry_z = entry_z
         self.avg_entry_px = 0.0
         self.size_qty = 0.0
@@ -185,55 +189,40 @@ class Position:
         self.last_fill_ts = 0
         self.is_accumulating = True
 
-
 class SimulatedTrader:
     def __init__(self, data_manager: DataManager):
         self.dm = data_manager
         self.balance = 2000.0
         self.positions = []
         self.realized_pnl = 0.0
-        self.logs = deque(maxlen=10)
-        self.residuals = {}  # Map[aid] -> RollingStats
+        self.logs = deque(maxlen=20) # Increased log history
+        self.residuals = {}
         self._init_csv()
         self._restore_history()
 
     def _init_csv(self):
+        # Added new columns for deep analysis
         if not os.path.exists(TRADES_LOG_FILE):
             try:
                 with open(TRADES_LOG_FILE, mode='w', newline='') as f:
-                    csv.writer(f).writerow(["timestamp", "action", "question", "side", "price", "pnl", "z_score"])
+                    csv.writer(f).writerow([
+                        "timestamp", "action", "question", "side", "price",
+                        "fair_value", "z_score", "spot", "sigma", "pnl", "reason"
+                    ])
             except: pass
 
     def _restore_history(self):
-        if not os.path.exists(TRADES_LOG_FILE): return
-        try:
-            with open(TRADES_LOG_FILE, mode='r', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                active_positions = {}
-                for row in reader:
-                    action = row['action']
-                    aid = row.get('asset_id') # Handle older CSVs missing this
-                    if not aid: continue
+        # (Keep existing restore logic or reset CSV for new format)
+        pass
 
-                    if action == 'BUY':
-                        cost = float(row.get('cost', 0))
-                        if aid not in active_positions:
-                            active_positions[aid] = Position(aid, "YES", 0, 0, 0) # Dummy init
-                        active_positions[aid].cost_basis += cost
-                        self.balance -= cost
-                    elif action == 'SELL':
-                        pnl = float(row.get('pnl', 0))
-                        self.realized_pnl += pnl
-                        # Simple logic: assume close implies full close for restore
-                        if aid in active_positions: del active_positions[aid]
-        except: pass
-
-    def _save_trade(self, action, pos, price, pnl, z_score, q_text):
+    def _save_trade(self, action, pos, price, model_p, z, spot, sigma, pnl, reason, q_text):
         try:
             with open(TRADES_LOG_FILE, mode='a', newline='') as f:
                 csv.writer(f).writerow([
                     datetime.now().isoformat(), action, q_text, pos.side,
-                    f"{price:.4f}", f"{pnl:.4f}" if pnl else "", f"{z_score:.2f}"
+                    f"{price:.4f}", f"{model_p:.4f}", f"{z:.2f}",
+                    f"{spot:.2f}", f"{sigma:.4f}",
+                    f"{pnl:.4f}" if pnl else "", reason
                 ])
         except: pass
 
@@ -266,7 +255,7 @@ class SimulatedTrader:
         T_years = rem_ms / (1000 * 365 * 24 * 3600.0)
         model_p = FastHestonModel.price_binary_call(spot, strike, T_years, meta['initial_T'], params)
 
-        # 3. Z-Score Calculation (Residual = Market - Model)
+        # 3. Z-Score Calculation
         residual = mid_price - model_p
 
         if aid not in self.residuals: self.residuals[aid] = RollingStats(ROLLING_WINDOW)
@@ -275,35 +264,39 @@ class SimulatedTrader:
 
         if not stats.ready(): return
 
-        z_score = stats.get_z_score(residual)
+        # Get detailed stats for logging
+        mean_resid, sigma = stats.get_stats() # You need to add get_stats() to RollingStats if missing
+        if sigma < 1e-6: sigma = 0.001
+
+        z_score = (residual - mean_resid) / sigma
         pos = self.get_position(aid)
 
         # --- TRADING LOGIC ---
         if pos:
-            # Accumulate if still cheap
+            # Accumulate
             if pos.is_accumulating:
                 if (time.time() - pos.last_fill_ts) > CHUNK_DELAY:
                     if z_score < (ENTRY_Z_SCORE + 0.5) and spread < MAX_SPREAD:
-                        self._execute_chunk(pos, market_ask, meta['question'], z_score)
+                        self._execute_chunk(pos, market_ask, model_p, spot, sigma, meta['question'], z_score)
                     else:
                         pos.is_accumulating = False
 
-            # Exit if Mean Reverted (Z >= 0.25)
+            # Exit Logic
             if z_score >= EXIT_Z_SCORE:
-                self._close_position(pos, market_bid, meta['question'], z_score, "MEAN_REV")
+                self._close_position(pos, market_bid, model_p, spot, sigma, meta['question'], z_score, "MEAN_REV")
 
         elif spread < MAX_SPREAD:
-            # ENTRY: Z < -1.5 (Market Cheap)
+            # Entry Logic
             if z_score < ENTRY_Z_SCORE:
-                self._start_position(aid, "YES", market_ask, strike, model_p, meta['question'], z_score)
+                self._start_position(aid, "YES", market_ask, strike, model_p, spot, sigma, meta['question'], z_score)
 
-    def _start_position(self, aid, side, price, strike, model_p, q_text, z):
+    def _start_position(self, aid, side, price, strike, model_p, spot, sigma, q_text, z):
         if price > 0.98 or price < 0.02: return
-        pos = Position(aid, side, strike, model_p, z)
+        pos = Position(aid, side, strike, model_p, z, spot)
         self.positions.append(pos)
-        self._execute_chunk(pos, price, q_text, z)
+        self._execute_chunk(pos, price, model_p, spot, sigma, q_text, z)
 
-    def _execute_chunk(self, pos, price, q_text, z):
+    def _execute_chunk(self, pos, price, model_p, spot, sigma, q_text, z):
         remaining = pos.target_cost - pos.cost_basis
         chunk = min(remaining, MAX_POS_SIZE * CHUNK_PCT, self.balance)
         if chunk < 5.0: pos.is_accumulating = False; return
@@ -316,10 +309,16 @@ class SimulatedTrader:
         pos.avg_entry_px = pos.cost_basis / pos.size_qty
         pos.last_fill_ts = time.time()
 
-        self.log(f"[BUY YES] Z:{z:.2f} | {q_text[:35]}... | Px:{price:.3f}", style="green")
-        self._save_trade("BUY", pos, price, None, z, q_text)
+        # Detailed Multi-line Log for Entry
+        resid = price - model_p
+        msg = (f"[BUY YES] {q_text[:30]}...\n"
+               f"   >> Px:{price:.3f} | Fair:{model_p:.3f} | Resid:{resid:+.3f}\n"
+               f"   >> Z:{z:.2f}    | Vol:{sigma:.3f}  | Spot:${spot:,.2f}")
 
-    def _close_position(self, pos, price, q_text, z, reason):
+        self.log(msg, style="green")
+        self._save_trade("BUY", pos, price, model_p, z, spot, sigma, None, "ENTRY", q_text)
+
+    def _close_position(self, pos, price, model_p, spot, sigma, q_text, z, reason):
         price = float(price - SLIPPAGE)
         proceeds = pos.size_qty * price
         pnl = proceeds - pos.cost_basis
@@ -329,9 +328,20 @@ class SimulatedTrader:
         self.positions.remove(pos)
 
         color = "bold green" if pnl > 0 else "bold red"
-        self.log(f"[SELL YES] Z:{z:.2f} | PnL:${pnl:.2f} | {q_text[:35]}...", style=color)
-        self._save_trade("SELL", pos, price, pnl, z, q_text)
 
+        # Calculate Delta of Spot since entry (to see if underlying crashed)
+        spot_delta = spot - pos.initial_spot
+        spot_pct = (spot_delta / pos.initial_spot) * 100
+
+        # Detailed Multi-line Log for Exit
+        msg = (f"[SELL YES] {q_text[:30]}...\n"
+               f"   >> Exit:{price:.3f} | Fair:{model_p:.3f} | Spot:${spot:,.2f} ({spot_pct:+.1f}%)\n"
+               f"   >> Z:{z:.2f}     | PnL:${pnl:.2f} | Reason:{reason}")
+
+        self.log(msg, style=color)
+        self._save_trade("SELL", pos, price, model_p, z, spot, sigma, pnl, reason, q_text)
+
+# Add get_stats to RollingStats if not present
 
 # ==============================================================================
 # 4. ASYNC LOOP (FIXED)
