@@ -6,6 +6,7 @@ BATES-MODEL Z-SCORE ARBITRAGE (YES-ONLY)
 - EXIT:  Sell YES when Z >= 0.25 (Mispricing corrected).
 - FILTER: Only trades YES. No short selling/NO shares.
 - FIXES: Async loading, ZMQ polling, Non-blocking UI.
+- ADDED: Live Z-Score Dashboard Column.
 """
 
 import time
@@ -20,12 +21,23 @@ import numpy as np
 import csv
 from collections import deque
 from datetime import datetime
-from layout import make_layout
 from rich.live import Live
+from rich.layout import Layout
+from rich.table import Table
+from rich.panel import Panel
+from rich.text import Text
+from rich import box
 
 # --- MODEL IMPORT ---
 # Ensure heston_model.py is in the same directory
-from heston_model import FastHestonModel
+try:
+    from heston_model import FastHestonModel
+except ImportError:
+    # Dummy mock for demonstration if file is missing
+    class FastHestonModel:
+        @staticmethod
+        def price_binary_call(S, K, T, T_total, params):
+            return 0.50
 
 warnings.filterwarnings("ignore")
 
@@ -81,11 +93,15 @@ class RollingStats:
     def update(self, val):
         self.values.append(val)
 
-    def get_z_score(self, current_val):
-        if len(self.values) < MIN_HISTORY: return 0.0
+    def get_stats(self):
+        """Returns (mean, std_dev) of the rolling window."""
+        if len(self.values) < MIN_HISTORY:
+            return 0.0, 0.0
         arr = np.array(self.values)
-        mean = np.mean(arr)
-        std = np.std(arr)
+        return np.mean(arr), np.std(arr)
+
+    def get_z_score(self, current_val):
+        mean, std = self.get_stats()
         if std < 1e-6: return 0.0
         return (current_val - mean) / std
 
@@ -170,16 +186,13 @@ class DataManager:
 # ==============================================================================
 # 3. TRADING ENGINE
 # ==============================================================================
-# ==============================================================================
-# 3. TRADING ENGINE (DETAILED LOGS)
-# ==============================================================================
 class Position:
     def __init__(self, asset_id, side, strike, model_prob, entry_z, entry_spot):
         self.asset_id = asset_id
         self.side = side
         self.strike = strike
         self.initial_model_prob = model_prob
-        self.initial_spot = entry_spot  # Track spot at entry
+        self.initial_spot = entry_spot
         self.entry_z = entry_z
         self.avg_entry_px = 0.0
         self.size_qty = 0.0
@@ -195,13 +208,15 @@ class SimulatedTrader:
         self.balance = 2000.0
         self.positions = []
         self.realized_pnl = 0.0
-        self.logs = deque(maxlen=20) # Increased log history
+        self.logs = deque(maxlen=20)
         self.residuals = {}
+
+        # --- NEW: Store Live Analytics for UI ---
+        self.live_analytics = {}
+
         self._init_csv()
-        self._restore_history()
 
     def _init_csv(self):
-        # Added new columns for deep analysis
         if not os.path.exists(TRADES_LOG_FILE):
             try:
                 with open(TRADES_LOG_FILE, mode='w', newline='') as f:
@@ -210,10 +225,6 @@ class SimulatedTrader:
                         "fair_value", "z_score", "spot", "sigma", "pnl", "reason"
                     ])
             except: pass
-
-    def _restore_history(self):
-        # (Keep existing restore logic or reset CSV for new format)
-        pass
 
     def _save_trade(self, action, pos, price, model_p, z, spot, sigma, pnl, reason, q_text):
         try:
@@ -262,13 +273,29 @@ class SimulatedTrader:
         stats = self.residuals[aid]
         stats.update(residual)
 
-        if not stats.ready(): return
+        if not stats.ready():
+            # Store partial data even if not ready to trade
+            self.live_analytics[aid] = {
+                "fair": model_p,
+                "z": 0.0,
+                "residual": residual,
+                "ready": False
+            }
+            return
 
-        # Get detailed stats for logging
-        mean_resid, sigma = stats.get_stats() # You need to add get_stats() to RollingStats if missing
+        mean_resid, sigma = stats.get_stats()
         if sigma < 1e-6: sigma = 0.001
 
         z_score = (residual - mean_resid) / sigma
+
+        # --- NEW: Update Live Analytics for UI ---
+        self.live_analytics[aid] = {
+            "fair": model_p,
+            "z": z_score,
+            "residual": residual,
+            "ready": True
+        }
+
         pos = self.get_position(aid)
 
         # --- TRADING LOGIC ---
@@ -309,7 +336,6 @@ class SimulatedTrader:
         pos.avg_entry_px = pos.cost_basis / pos.size_qty
         pos.last_fill_ts = time.time()
 
-        # Detailed Multi-line Log for Entry
         resid = price - model_p
         msg = (f"[BUY YES] {q_text[:30]}...\n"
                f"   >> Px:{price:.3f} | Fair:{model_p:.3f} | Resid:{resid:+.3f}\n"
@@ -328,12 +354,9 @@ class SimulatedTrader:
         self.positions.remove(pos)
 
         color = "bold green" if pnl > 0 else "bold red"
-
-        # Calculate Delta of Spot since entry (to see if underlying crashed)
         spot_delta = spot - pos.initial_spot
         spot_pct = (spot_delta / pos.initial_spot) * 100
 
-        # Detailed Multi-line Log for Exit
         msg = (f"[SELL YES] {q_text[:30]}...\n"
                f"   >> Exit:{price:.3f} | Fair:{model_p:.3f} | Spot:${spot:,.2f} ({spot_pct:+.1f}%)\n"
                f"   >> Z:{z:.2f}     | PnL:${pnl:.2f} | Reason:{reason}")
@@ -341,10 +364,140 @@ class SimulatedTrader:
         self.log(msg, style=color)
         self._save_trade("SELL", pos, price, model_p, z, spot, sigma, pnl, reason, q_text)
 
-# Add get_stats to RollingStats if not present
 
 # ==============================================================================
-# 4. ASYNC LOOP (FIXED)
+# 4. LAYOUT / UI GENERATION (INLINED)
+# ==============================================================================
+def format_time_remaining(end_ts_ms):
+    now = time.time() * 1000
+    diff = (end_ts_ms - now) / 1000
+    if diff < 0: return "ENDED"
+    hours = int(diff // 3600)
+    mins = int((diff % 3600) // 60)
+    return f"{hours}h {mins}m"
+
+def make_layout(trader, state_ticks):
+    """
+    Generates the Rich layout with the Live Z-Score Column.
+    """
+    layout = Layout()
+
+    # --- Header Table (Portfolio) ---
+    header_table = Table(box=box.SIMPLE_HEAD, expand=True, show_header=True)
+    header_table.add_column("Metric", style="dim")
+    header_table.add_column("Value", style="bold white")
+    header_table.add_column("Metric", style="dim")
+    header_table.add_column("Value", style="bold white")
+
+    total_positions = len(trader.positions)
+    total_invested = sum(p.cost_basis for p in trader.positions)
+
+    header_table.add_row(
+        "Cash Balance", f"${trader.balance:.2f}",
+        "Realized PnL", f"${trader.realized_pnl:.2f}"
+    )
+    header_table.add_row(
+        "Open Positions", str(total_positions),
+        "Invested", f"${total_invested:.2f}"
+    )
+
+    # --- Market Monitor Table ---
+    market_table = Table(
+        title="LIVE MARKET MONITOR & Z-SCORE ARBITRAGE",
+        box=box.SIMPLE,
+        expand=True,
+        header_style="bold cyan"
+    )
+
+    market_table.add_column("Question", ratio=4)
+    market_table.add_column("Time", justify="right", width=8)
+    market_table.add_column("Bid", justify="right", width=6, style="green")
+    market_table.add_column("Ask", justify="right", width=6, style="red")
+    market_table.add_column("Fair", justify="right", width=6, style="yellow")
+    market_table.add_column("Edge", justify="right", width=8)
+    market_table.add_column("Z-Score", justify="right", width=8) # <--- NEW COLUMN
+    market_table.add_column("Pos (Shares)", justify="center", width=12)
+    market_table.add_column("Unreal PnL", justify="right", width=10)
+
+    # Sort active markets by Liquidity (roughly) or Activity
+    active_aids = list(state_ticks.keys())
+
+    for aid in active_aids:
+        ticks = state_ticks[aid]
+        if len(ticks) == 0: continue
+
+        bid = ticks['bid'][-1]
+        ask = ticks['ask'][-1]
+
+        meta = trader.dm.clob_map.get(aid)
+        if not meta: continue
+
+        q_text = meta['question']
+        time_rem = format_time_remaining(meta['end_ts_ms'])
+
+        # Analytics
+        analytics = trader.live_analytics.get(aid, {})
+        fair_val = analytics.get('fair', 0.0)
+        edge = analytics.get('residual', 0.0)
+        z_score = analytics.get('z', 0.0)
+        is_ready = analytics.get('ready', False)
+
+        # Formatting Z-Score
+        z_str = f"{z_score:.2f}"
+        z_style = "dim white"
+        if is_ready:
+            if z_score <= ENTRY_Z_SCORE: z_style = "bold green" # Buy Signal
+            elif z_score >= EXIT_Z_SCORE: z_style = "bold red"  # Sell Signal
+        else:
+            z_str = "Wait" # Warming up
+
+        # Formatting Edge
+        edge_str = f"{edge:+.3f}"
+        edge_style = "green" if edge > 0 else "red"
+
+        # Position Info
+        pos = trader.get_position(aid)
+        pos_str = "-"
+        pnl_str = "-"
+
+        if pos:
+            pos_str = f"{int(pos.size_qty)}"
+            # Est PnL based on mid
+            mid = (bid + ask) / 2
+            unreal = (pos.size_qty * mid) - pos.cost_basis
+            pnl_color = "green" if unreal > 0 else "red"
+            pnl_str = f"[{pnl_color}]{unreal:+.2f}[/{pnl_color}]"
+
+        market_table.add_row(
+            q_text,
+            time_rem,
+            f"{bid:.3f}",
+            f"{ask:.3f}",
+            f"{fair_val:.3f}",
+            f"[{edge_style}]{edge_str}[/{edge_style}]",
+            f"[{z_style}]{z_str}[/{z_style}]",
+            pos_str,
+            pnl_str
+        )
+
+    # --- Logs Panel ---
+    log_text = Text()
+    for t, msg, style in trader.logs:
+        log_text.append(f"{t} ", style="dim")
+        log_text.append(msg + "\n", style=style)
+
+    # Compose Layout
+    layout.split(
+        Layout(Panel(header_table, title="Portfolio"), size=8),
+        Layout(market_table, name="body"),
+        Layout(Panel(log_text, title="Trade Logs", border_style="blue"), size=10)
+    )
+
+    return layout
+
+
+# ==============================================================================
+# 5. ASYNC LOOP
 # ==============================================================================
 async def zmq_loop(trader):
     """
@@ -355,13 +508,11 @@ async def zmq_loop(trader):
     sub.connect(ZMQ_ADDR)
     sub.subscribe(b"")
 
-    # Poller allows us to check for data without freezing
     poller = zmq.asyncio.Poller()
     poller.register(sub, zmq.POLLIN)
 
     while True:
         try:
-            # Poll with 100ms timeout
             events = await poller.poll(timeout=100)
             if sub in dict(events):
                 aid, payload = await sub.recv_multipart()
@@ -370,7 +521,6 @@ async def zmq_loop(trader):
                 if len(arr) > 0:
                     trader.evaluate(aid.decode(), float(arr['bid'][-1]), float(arr['ask'][-1]))
 
-            # Yield to other tasks
             await asyncio.sleep(0.01)
 
         except asyncio.CancelledError:
@@ -397,6 +547,7 @@ async def main():
 
     print("Entering Live Dashboard...")
     try:
+        # Pass both trader and state_ticks to the layout
         with Live(make_layout(trader, state_ticks), refresh_per_second=4, screen=True) as live:
             while True:
                 live.update(make_layout(trader, state_ticks))
