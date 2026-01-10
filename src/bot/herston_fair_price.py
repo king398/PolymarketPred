@@ -42,7 +42,7 @@ BINANCE_WS = "wss://stream.binance.com:9443/stream?streams=btcusdt@trade/ethusdt
 MIN_VELOCITY_BUY = 0.005  # How fast price must be moving up to buy
 MAX_SPREAD = 0.08  # Max difference between Bid/Ask to allow entry
 MAX_POS_SIZE = 100.0  # Dollars per trade
-TAKER_FEE_PCT = 0.0125  # 1% Fee (Standard Taker Fee)
+TAKER_FEE_PCT = 0.00125  # 1% Fee (Standard Taker Fee)
 
 # --- EXIT PARAMETERS ---
 STAG_TOLERANCE = 0.015  # Velocity close to 0 is stagnation
