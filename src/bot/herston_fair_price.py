@@ -397,7 +397,9 @@ async def poly_zmq_worker(bot):
     ctx = zmq.asyncio.Context.instance()
     sub = ctx.socket(zmq.SUB)
     sub.connect(ZMQ_ADDR)
+    sub.setsockopt(zmq.CONFLATE, 1)
     sub.subscribe(b"")
+
     while True:
         try:
             aid, payload = await sub.recv_multipart()
