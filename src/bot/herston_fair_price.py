@@ -405,12 +405,23 @@ async def poly_zmq_worker(bot):
             if len(arr) > 0:
                 latest_bid = arr['bid'][-1]
                 latest_ask = arr['ask'][-1]
-                # Lowered Filter to allow cheaper options
-                if latest_bid > 0.005 and latest_ask > 0.005:
-                    state_ticks[aid.decode()] = arr
+
+                # --- FILTER LOGIC STARTS HERE ---
+
+                # 1. Reject specific "Glitch" price (0.010)
+                # We check if the price is within 0.0001 of 0.01 to catch floats like 0.0099999 or 0.0100001
+                if abs(latest_bid - 0.01) < 0.0001 or abs(latest_ask - 0.01) < 0.0001:
+                    continue  # Skip this tick entirely
+
+                # 2. Reject "Dead" prices (too close to zero)
+                if latest_bid < 0.005 or latest_ask < 0.005:
+                    continue
+
+                # Valid tick found, update state
+                state_ticks[aid.decode()] = arr
+
         except:
             await asyncio.sleep(0.01)
-
 
 # ==============================================================================
 # 4. DASHBOARD
