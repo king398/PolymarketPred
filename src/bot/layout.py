@@ -149,9 +149,8 @@ def get_unified_rows(trader, state_ticks):
             entry_str = f"{pos.avg_entry_px:.3f}"
 
         # Check cooldown state
-        is_cooling = aid in trader.cooldowns
 
-        if pos is None and not is_cooling and abs(edge_val) < 0.005 and rem_ms > 3600000:
+        if pos is None  and abs(edge_val) < 0.005 and rem_ms > 3600000:
             continue
 
         e_color = "green" if edge_val > 0 else "red"
