@@ -10,13 +10,13 @@ print(f"Max difference between open and close: {max_diff}")
 df["log_return"].fillna(0, inplace=True)
 df['log_return'].hist(bins=100)
 plt.show()"""
-def find_optimal_horizon(df, max_lag=600):
+def find_optimal_horizon(df, max_lag=1800):
     """
     Calculates the correlation between current return and future return
     at different horizons.
     """
     correlations = []
-    lags = range(1, max_lag, 10) # Check every 10 seconds
+    lags = range(600, max_lag, 50) # Check every 10 seconds
 
     # Calculate 1-step returns first
     # (Log returns are additive, so we can sum them later)

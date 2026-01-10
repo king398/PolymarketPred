@@ -1,10 +1,11 @@
 """
 BATES-MODEL VALUE ARBITRAGE SIM (Polymarket Up/Down)
-- DETAILED LOGS: Multi-line logs with Spot, Strike, Model Price, Edge, ROI, Duration.
-- DYNAMIC EDGE: Requires larger margin of safety for cheap options (Anti-Theta).
-- VEGA FILTER: Rejects OTM options with low sensitivity to vol (Dynamic threshold).
+- PROFILE: Low-Risk Scalper (High Frequency, Small Wins, Tight Spreads).
+- SPREAD AWARE: Rejects trades where spread cost > 50% of profit target.
+- DYNAMIC EDGE: Requires larger margin of safety for cheap options.
+- VEGA FILTER: Rejects OTM options with low sensitivity to vol.
 - UNIFIED UI: Single table for scanner & portfolio.
-- FAILSAFE EXIT: Hysteresis added to stop whipsaw exits.
+- FAILSAFE EXIT: Tighter stops and take-profits.
 - STATE RESTORE: Reloads positions from CSV.
 """
 
@@ -18,18 +19,19 @@ import requests
 import warnings
 import numpy as np
 import csv
-from collections import deque, defaultdict
+from collections import deque
 from datetime import datetime
 from layout import make_layout
 from rich.live import Live
 
 # --- MODEL IMPORT ---
+# Ensure heston_model.py is in the same directory or python path
 from heston_model import FastHestonModel
 
 warnings.filterwarnings("ignore")
 
 # ==============================================================================
-# 0. CONFIGURATION
+# 0. CONFIGURATION (LOW RISK SCALPER)
 # ==============================================================================
 ZMQ_ADDR = "tcp://127.0.0.1:5567"
 BINANCE_API = "https://api.binance.com/api/v3/ticker/price"
@@ -42,43 +44,27 @@ STRIKES_FILE = os.path.join(DATA_DIR, "market_1m_candle_opens.jsonl")
 TRADES_LOG_FILE = os.path.join(DATA_DIR, "sim_trade_history.csv")
 
 # Strategy Parameters
-BASE_MIN_EDGE = 0.02        # Standard edge for ITM/ATM
-HIGH_CONVICTION_EDGE = 0.05 # Higher edge for OTM (Cheap) options
-MAX_POS_SIZE = 100.0
+BASE_MIN_EDGE = 0.01        # 1% Edge. (Takes small positive EV trades)
+HIGH_CONVICTION_EDGE = 0.02 # 2% Edge for OTM (Reduced from 5%)
+MAX_POS_SIZE = 15.0         # $15 Max Position (Low Risk per trade)
 SLIPPAGE = 0.0002
-LIQUIDATION_THRESH = 0.10
-COOLDOWN_DURATION = 60.0
-MAX_SPREAD = 0.10
+LIQUIDATION_THRESH = 0.05   # Trade closer to expiry allowed (5%)
+COOLDOWN_DURATION = 10.0    # 10s Cooldown (Fast re-entry)
+
+# Spread & Scalp Control
+MAX_SPREAD = 0.05           # Hard Limit: Never trade if spread > 5 cents
+SCALP_TARGET_ROI = 0.04     # Target 4% profit per trade
+SPREAD_RATIO_LIMIT = 0.5    # Spread must be < 50% of the target profit amount
 
 # Vega Filtering (OTM Protection)
 ENABLE_VEGA_FILTER = True
-MIN_VEGA_ATM = 0.05         # Minimum Vega required when Near-the-Money
-VEGA_DIST_SCALER = 3.0
+MIN_VEGA_ATM = 0.02         # Lower sensitivity requirement for scalping
+VEGA_DIST_SCALER = 1.5      # Relaxed OTM penalty
 
 # Risk Management
-THESIS_TOLERANCE = 0.05
-CHUNK_PCT = 0.2
-CHUNK_DELAY = 2.0
-
-# -------------------- NEW (minimal, high-impact) --------------------
-# These target your biggest loss driver: fast MODEL-ARB-EXIT whipsaws + exiting into bad spreads.
-
-# Require edge to persist N consecutive checks before ENTER / ADD-CHUNK
-ENTRY_CONFIRM_TICKS = 3
-
-# Require model-exit condition to persist M checks before EXIT
-EXIT_CONFIRM_TICKS = 3
-
-# Don't allow MODEL-ARB-EXIT immediately after entry (reduces instant puke into bid)
-MIN_HOLD_BEFORE_MODEL_EXIT_SEC = 15
-
-# Penalize spread when computing "net edge" so tiny edges don't trigger trades in wide books
-EDGE_SPREAD_PENALTY_ALPHA = 0.5  # 0.0 = old behavior, 0.5 is a good start
-
-# Hard stop to cap tail losses; only fires when spread isn't crazy and after minimum hold
-HARD_STOP_ROI = -0.35            # cap very bad losses (~-25%)
-EXIT_SPREAD_CAP = 0.08           # if spread > this, avoid forced exits (prevents selling into garbage bids)
-# -------------------------------------------------------------------
+THESIS_TOLERANCE = 0.02
+CHUNK_PCT = 0.5             # Buy in larger chunks (2 chunks max) for speed
+CHUNK_DELAY = 1.0           # 1s delay between chunks
 
 # Time Constants
 MIN_15 = 15 / (60 * 24 * 365)
@@ -96,6 +82,7 @@ tick_dtype = np.dtype([
 ])
 
 state_ticks = {}
+
 
 # ==============================================================================
 # 1. DATA MANAGEMENT
@@ -116,8 +103,7 @@ class DataManager:
                     try:
                         p = json.loads(line)
                         self.bates_params[p['currency']] = p
-                    except:
-                        pass
+                    except: pass
 
         # Load Strikes
         if os.path.exists(STRIKES_FILE):
@@ -127,27 +113,21 @@ class DataManager:
                         obj = json.loads(line)
                         if "clob_token_id" in obj and "strike_price" in obj:
                             self.strikes[obj["clob_token_id"]] = float(obj["strike_price"])
-                    except:
-                        pass
+                    except: pass
 
         # Load Metadata (CLOB IDs)
         if os.path.exists(ASSET_ID_FILE):
             with open(ASSET_ID_FILE, "r") as f:
                 for line in f:
-                    if not line.strip():
-                        continue
+                    if not line.strip(): continue
                     try:
                         m = json.loads(line)
                         slug = m.get('slug', '').lower()
                         underlying = None
-                        if 'bitcoin' in slug or 'btc' in slug:
-                            underlying = "BTC"
-                        elif 'ethereum' in slug or 'eth' in slug:
-                            underlying = "ETH"
-                        elif 'solana' in slug or 'sol' in slug:
-                            underlying = "SOL"
-                        elif 'xrp' in slug:
-                            underlying = "XRP"
+                        if 'bitcoin' in slug or 'btc' in slug: underlying = "BTC"
+                        elif 'ethereum' in slug or 'eth' in slug: underlying = "ETH"
+                        elif 'solana' in slug or 'sol' in slug: underlying = "SOL"
+                        elif 'xrp' in slug: underlying = "XRP"
 
                         if underlying and m.get('clob_token_id'):
                             cat = m.get('category', '1h')
@@ -160,8 +140,7 @@ class DataManager:
                                 "initial_T": t_years,
                                 "initial_duration_ms": t_years * YEAR_MS
                             }
-                    except:
-                        pass
+                    except: pass
         return len(self.strikes)
 
     async def watch_metadata(self):
@@ -177,9 +156,9 @@ class DataManager:
                     r = requests.get(BINANCE_API, params={"symbol": ticker}, timeout=2)
                     if r.status_code == 200:
                         self.spot_prices[sym] = float(r.json()['price'])
-            except Exception:
-                pass
+            except Exception: pass
             await asyncio.sleep(1.0)
+
 
 # ==============================================================================
 # 2. TRADING ENGINE
@@ -198,6 +177,7 @@ class Position:
         self.last_fill_ts = 0
         self.is_accumulating = True
 
+
 class SimulatedTrader:
     def __init__(self, data_manager: DataManager):
         self.dm = data_manager
@@ -206,13 +186,6 @@ class SimulatedTrader:
         self.realized_pnl = 0.0
         self.logs = deque(maxlen=10)
         self.cooldowns = {}
-
-        # -------------------- NEW (minimal state) --------------------
-        # Per-asset confirmation counters to prevent enter/exit whipsaw.
-        self.entry_confirm = defaultdict(int)  # aid -> consecutive pass count
-        self.exit_confirm = defaultdict(int)   # aid -> consecutive exit-trigger count
-        # -------------------------------------------------------------
-
         self._init_csv()
         self._restore_history()
 
@@ -226,8 +199,7 @@ class SimulatedTrader:
                 self.log(f"CSV Init Error: {e}", style="red")
 
     def _restore_history(self):
-        if not os.path.exists(TRADES_LOG_FILE):
-            return
+        if not os.path.exists(TRADES_LOG_FILE): return
         self.log("Restoring history from CSV...", style="bold yellow")
         try:
             with open(TRADES_LOG_FILE, mode='r', encoding='utf-8') as f:
@@ -242,8 +214,7 @@ class SimulatedTrader:
                         qty = float(row['quantity']) if row['quantity'] else 0.0
                         cost = float(row['cost']) if row['cost'] else 0.0
                         pnl = float(row['pnl']) if row['pnl'] else 0.0
-                    except:
-                        continue
+                    except: continue
 
                     if action == 'BUY':
                         self.balance -= cost
@@ -253,19 +224,16 @@ class SimulatedTrader:
                         pos = active_positions[aid]
                         pos.cost_basis += cost
                         pos.size_qty += qty
-                        if pos.size_qty > 0:
-                            pos.avg_entry_px = pos.cost_basis / pos.size_qty
+                        if pos.size_qty > 0: pos.avg_entry_px = pos.cost_basis / pos.size_qty
                         pos.is_accumulating = False
-                    elif action in ['SELL', 'LIQ', 'TAKE-PROFIT', 'STOP-LOSS', 'THESIS-BROKEN', 'MODEL-ARB-EXIT']:
+                    elif action in ['SELL', 'LIQ', 'SCALP-WIN', 'STOP-LOSS', 'EDGE-DECAY']:
                         self.balance += (qty * price)
                         self.realized_pnl += pnl
-                        if aid in active_positions:
-                            del active_positions[aid]
+                        if aid in active_positions: del active_positions[aid]
                     elif action == 'SETTLE':
                         self.balance += (qty * price)
                         self.realized_pnl += pnl
-                        if aid in active_positions:
-                            del active_positions[aid]
+                        if aid in active_positions: del active_positions[aid]
                 self.positions = list(active_positions.values())
         except Exception as e:
             self.log(f"Error restoring: {e}", style="red")
@@ -273,28 +241,15 @@ class SimulatedTrader:
     def _save_trade(self, action, pos, price, qty, cost, pnl, reason, question):
         try:
             with open(TRADES_LOG_FILE, mode='a', newline='', encoding='utf-8') as f:
-                csv.writer(f).writerow([
-                    datetime.now().isoformat(),
-                    action,
-                    question,
-                    pos.asset_id,
-                    pos.side,
-                    f"{price:.4f}",
-                    f"{qty:.4f}",
-                    f"{cost:.4f}",
-                    f"{pnl:.4f}" if pnl is not None else "",
-                    reason
-                ])
-        except:
-            pass
+                csv.writer(f).writerow([datetime.now().isoformat(), action, question, pos.asset_id, pos.side, f"{price:.4f}", f"{qty:.4f}", f"{cost:.4f}", f"{pnl:.4f}" if pnl is not None else "", reason])
+        except: pass
 
     def log(self, msg, style="white"):
         self.logs.append((time.strftime("%H:%M:%S"), msg, style))
 
     def get_position(self, aid):
         for p in self.positions:
-            if p.asset_id == aid:
-                return p
+            if p.asset_id == aid: return p
         return None
 
     def _format_duration(self, start_ts):
@@ -318,16 +273,8 @@ class SimulatedTrader:
         self._save_trade("SETTLE", pos, outcome, pos.size_qty, pos.cost_basis, pnl, "EXPIRATION", q_text)
         self.positions.remove(pos)
 
-        # NEW: reset counters on close
-        self.entry_confirm[pos.asset_id] = 0
-        self.exit_confirm[pos.asset_id] = 0
-        self.cooldowns[pos.asset_id] = time.time()
-
     def _estimate_heston_vega(self, spot, strike, T_years, init_T, params, base_price):
-        """
-        Calculates Vega via Finite Difference on the Heston v0 (Initial Variance).
-        Returns the change in price per 1% change in Volatility (approx).
-        """
+        """Calculates Vega via Finite Difference on Heston v0."""
         try:
             bump = 0.01
             p_bump = params.copy()
@@ -337,20 +284,10 @@ class SimulatedTrader:
         except:
             return 0.0
 
-    def _net_edge(self, model_p: float, bid: float, ask: float) -> float:
-        """
-        NEW: Spread-aware edge. This prevents tiny edges from triggering trades in wide books.
-        """
-        spread = max(0.0, ask - bid)
-        effective_ask = ask + SLIPPAGE
-        # penalize spread a bit + include slippage
-        return float(model_p - effective_ask - EDGE_SPREAD_PENALTY_ALPHA * spread)
-
     def evaluate(self, aid, market_bid, market_ask):
         meta = self.dm.clob_map.get(aid)
         strike = self.dm.strikes.get(aid)
-        if not (meta and strike):
-            return
+        if not (meta and strike): return
 
         now_ms = int(time.time() * 1000)
         rem_ms = meta['end_ts_ms'] - now_ms
@@ -359,118 +296,84 @@ class SimulatedTrader:
 
         # Expiration Handling
         if rem_ms <= 0:
-            if pos:
-                self._settle_position(pos, (market_bid + market_ask) / 2, meta['question'])
+            if pos: self._settle_position(pos, (market_bid+market_ask)/2, meta['question'])
             return
 
+        # 1. HARD SPREAD FILTER (Risk Control)
+        # If the market is too wide, we cannot scalp it safely.
+        if spread > MAX_SPREAD: return
+
         # Dead Market Protection
-        if pos and market_bid <= 0.02:
-            return
+        if pos and market_bid <= 0.02: return
 
         spot = self.dm.spot_prices.get(meta['underlying'])
         params = self.dm.bates_params.get(meta['underlying'])
-        if not (spot and params):
-            return
+        if not (spot and params): return
 
         T_years = rem_ms / (1000 * 365 * 24 * 3600.0)
         t_days = rem_ms / (1000 * 3600 * 24.0)
         model_p = FastHestonModel.price_binary_call(spot, strike, T_years, meta['initial_T'], params)
+        yes_edge = model_p - market_ask
 
         # Dynamic Edge Requirement
         required_edge = HIGH_CONVICTION_EDGE if market_ask < 0.40 else BASE_MIN_EDGE
-
-        # NEW: net edge (spread-aware)
-        yes_edge_net = self._net_edge(model_p, market_bid, market_ask)
-
-        # Basic spread guard stays (you had this)
-        if spread > MAX_SPREAD:
-            # also reset entry confirmation if market gets ugly
-            self.entry_confirm[aid] = 0
-            return
 
         if pos:
             # Manage Existing Position
             if pos.is_accumulating:
                 if (time.time() - pos.last_fill_ts) >= CHUNK_DELAY:
-                    # NEW: require edge persistence even for adding chunks
-                    if pos.side == "YES" and yes_edge_net > required_edge:
-                        self.entry_confirm[aid] += 1
+                    if spread > MAX_SPREAD: return
+                    if pos.side == "YES" and yes_edge > required_edge:
+                        self._execute_chunk(pos, market_ask, meta['question'], model_p, spot, yes_edge, t_days)
                     else:
-                        self.entry_confirm[aid] = 0
-
-                    if pos.side == "YES" and self.entry_confirm[aid] >= ENTRY_CONFIRM_TICKS:
-                        self._execute_chunk(pos, market_ask, meta['question'], model_p, spot, yes_edge_net, t_days)
-                    else:
-                        # stop accumulating if edge isn't consistent
                         pos.is_accumulating = False
             else:
-                self._check_exit(
-                    pos,
-                    model_p,
-                    market_bid,
-                    market_ask,
-                    meta['question'],
-                    t_days,
-                    spread=spread
-                )
+                self._check_exit(pos, model_p, market_bid, market_ask, meta['question'], t_days)
         else:
             # Check New Entry
             if aid in self.cooldowns:
-                if (time.time() - self.cooldowns[aid]) < COOLDOWN_DURATION:
+                if (time.time() - self.cooldowns[aid]) < COOLDOWN_DURATION: return
+                else: del self.cooldowns[aid]
+
+            if (rem_ms/meta['initial_duration_ms']) > LIQUIDATION_THRESH:
+
+                # --- SPREAD EFFICIENCY CHECK ---
+                # "Is the spread too expensive relative to the profit?"
+                projected_profit_amt = market_ask * SCALP_TARGET_ROI
+                if spread > (projected_profit_amt * SPREAD_RATIO_LIMIT):
+                    # Spread eats too much of the potential win.
                     return
-                else:
-                    del self.cooldowns[aid]
 
-            if (rem_ms / meta['initial_duration_ms']) > LIQUIDATION_THRESH:
+                # --- RISK-ADJUSTED EDGE CHECK ---
+                # Edge must cover most of the spread to be valid
+                if yes_edge > required_edge and yes_edge > (spread * 0.8):
 
-                # --- VEGA FILTER LOGIC ---
-                is_otm = spot < strike
-                passed_vega_check = True
+                    # --- VEGA FILTER ---
+                    is_otm = spot < strike
+                    passed_vega_check = True
 
-                if ENABLE_VEGA_FILTER and is_otm and yes_edge_net > required_edge:
-                    dist_pct = (strike - spot) / spot
-                    vega = self._estimate_heston_vega(spot, strike, T_years, meta['initial_T'], params, model_p)
-                    vega_threshold = MIN_VEGA_ATM + (dist_pct * VEGA_DIST_SCALER)
+                    if ENABLE_VEGA_FILTER and is_otm:
+                        dist_pct = (strike - spot) / spot
+                        vega = self._estimate_heston_vega(spot, strike, T_years, meta['initial_T'], params, model_p)
+                        vega_threshold = MIN_VEGA_ATM + (dist_pct * VEGA_DIST_SCALER)
 
-                    if vega < vega_threshold:
-                        passed_vega_check = False
+                        if vega < vega_threshold:
+                            passed_vega_check = False
 
-                # NEW: Entry confirmation (persistence)
-                if passed_vega_check and yes_edge_net > required_edge:
-                    self.entry_confirm[aid] += 1
-                else:
-                    self.entry_confirm[aid] = 0
-
-                if passed_vega_check and self.entry_confirm[aid] >= ENTRY_CONFIRM_TICKS:
-                    self._start_position(
-                        aid,
-                        "YES",
-                        market_ask,
-                        model_p,
-                        strike,
-                        meta['question'],
-                        spot,
-                        yes_edge_net,
-                        t_days
-                    )
+                    if passed_vega_check:
+                        self._start_position(aid, "YES", market_ask, model_p, strike, meta['question'], spot, yes_edge, t_days)
 
     def _start_position(self, aid, side, price, model_p, strike, q_text, spot, edge, t_days):
-        if price <= 0.15 or price >= 0.95:
-            return
+        if price <= 0.10 or price >= 0.95: return
         pos = Position(aid, side, strike, model_p)
         self.positions.append(pos)
-
-        # NEW: reset exit confirmation on entry
-        self.exit_confirm[aid] = 0
-
         self._execute_chunk(pos, price, q_text, model_p, spot, edge, t_days)
 
     def _execute_chunk(self, pos, price, q_text, model_p, spot, edge, t_days):
         remaining = pos.target_cost - pos.cost_basis
         chunk = min(remaining, MAX_POS_SIZE * CHUNK_PCT, self.balance)
         if chunk < 1.0:
-            pos.is_accumulating = False
-            return
+            pos.is_accumulating = False; return
 
         price = float(price + SLIPPAGE)
         qty = chunk / price
@@ -481,67 +384,45 @@ class SimulatedTrader:
         pos.last_fill_ts = time.time()
 
         msg = (f"[BUY] {pos.side} | {q_text}\n"
-               f"   >> Px: {price:.3f} | Fair: {model_p:.3f} | Edge(net): {edge:.3f}\n"
+               f"   >> Px: {price:.3f} | Fair: {model_p:.3f} | Edge: {edge:.3f}\n"
                f"   >> Spot: ${spot:,.2f} | Strike: {pos.strike:,.0f} | Exp: {t_days:.1f}d")
 
         self.log(msg, style="dim green")
         self._save_trade("BUY", pos, price, qty, chunk, None, "ENTRY_CHUNK", q_text)
-        if pos.cost_basis >= pos.target_cost * 0.99:
-            pos.is_accumulating = False
+        if pos.cost_basis >= pos.target_cost * 0.99: pos.is_accumulating = False
 
-    def _check_exit(self, pos, model_p, bid, ask, q_text, t_days, spread: float, force=False):
-        # effective exit price (old logic, just made explicit)
-        exit_px = (bid - SLIPPAGE)
+    def _check_exit(self, pos, model_p, bid, ask, q_text, t_days, force=False):
+        # Use bid for exit estimation
+        exit_px = bid - SLIPPAGE
         pnl = (pos.size_qty * exit_px) - pos.cost_basis
         roi = pnl / max(pos.cost_basis, 1e-6)
+
         should_close = force
         msg_type = "LIQ" if force else "CLOSE"
 
-        held_sec = time.time() - pos.start_ts
-
         if not force:
-            # Take Profit (keep exactly as-is; it performed well in your logs)
-            if roi >= 0.10:
+            # 1. SCALP WIN (Target Hit)
+            if roi >= SCALP_TARGET_ROI:
                 should_close = True
-                msg_type = "TAKE-PROFIT"
-                self.exit_confirm[pos.asset_id] = 0
+                msg_type = "SCALP-WIN"
 
-            else:
-                # NEW: hard stop-loss to cap tail events, but don't exit into horrible spreads
-                if (roi <= HARD_STOP_ROI) and (held_sec >= MIN_HOLD_BEFORE_MODEL_EXIT_SEC) and (spread <= EXIT_SPREAD_CAP):
-                    should_close = True
-                    msg_type = "STOP-LOSS"
-                    self.exit_confirm[pos.asset_id] = 0
+            # 2. STOP LOSS (Strict)
+            # Cut at 8% loss to preserve capital
+            elif roi <= -0.08:
+                should_close = True
+                msg_type = "STOP-LOSS"
 
-                # Model Exit with persistence + min-hold + avoid garbage spread exits
-                else:
-                    if held_sec < MIN_HOLD_BEFORE_MODEL_EXIT_SEC:
-                        # too early to trust flips
-                        self.exit_confirm[pos.asset_id] = 0
-                    else:
-                        # original condition: model_p < (bid - 0.05)
-                        # keep the spirit, but require persistence and avoid exits when spread is ugly
-                        exit_condition = (pos.side == "YES" and model_p < (bid - 0.05) and spread <= EXIT_SPREAD_CAP)
-
-                        if exit_condition:
-                            self.exit_confirm[pos.asset_id] += 1
-                        else:
-                            self.exit_confirm[pos.asset_id] = 0
-
-                        if self.exit_confirm[pos.asset_id] >= EXIT_CONFIRM_TICKS:
-                            should_close = True
-                            msg_type = "MODEL-ARB-EXIT"
-                            self.exit_confirm[pos.asset_id] = 0
+            # 3. EDGE DECAY (Thesis Broken)
+            # If Model Price drops below the MID PRICE (spread center), edge is weak.
+            mid_price = (bid + ask) / 2
+            if pos.side == "YES" and model_p < mid_price:
+                should_close = True
+                msg_type = "EDGE-DECAY"
 
         if should_close:
             self.balance += (pos.size_qty * exit_px)
             self.realized_pnl += pnl
-            self.positions.remove(pos)
-
-            # NEW: cooldown after any close (reduces immediate re-entry churn)
-            self.cooldowns[pos.asset_id] = time.time()
-            self.entry_confirm[pos.asset_id] = 0
-            self.exit_confirm[pos.asset_id] = 0
+            if pos in self.positions: self.positions.remove(pos)
 
             color = "green" if pnl > 0 else "red"
             dur = self._format_duration(pos.start_ts)
@@ -552,6 +433,9 @@ class SimulatedTrader:
 
             self.log(msg, style=f"bold {color}")
             self._save_trade("SELL", pos, exit_px, pos.size_qty, pos.cost_basis, pnl, msg_type, q_text)
+
+            # Cooldown to prevent re-buying immediately
+            self.cooldowns[pos.asset_id] = time.time()
 
 # ==============================================================================
 # 3. ASYNC LOOP
@@ -566,15 +450,13 @@ async def zmq_loop(trader):
             aid, payload = await sub.recv_multipart()
             arr = np.frombuffer(payload, dtype=tick_dtype)
             state_ticks[aid.decode()] = arr
-            if len(arr) > 0:
-                trader.evaluate(aid.decode(), float(arr['bid'][-1]), float(arr['ask'][-1]))
-        except:
-            await asyncio.sleep(0.1)
+            if len(arr) > 0: trader.evaluate(aid.decode(), float(arr['bid'][-1]), float(arr['ask'][-1]))
+        except: await asyncio.sleep(0.1)
 
 async def main():
     dm = DataManager()
     dm._load_sync()
-    print("Initializing Unified Bates Model Sim with Vega Filter...")
+    print("Initializing Unified Bates Model SCALPER (Low Risk)...")
     trader = SimulatedTrader(dm)
     asyncio.create_task(dm.update_spot_prices())
     asyncio.create_task(zmq_loop(trader))
@@ -585,7 +467,5 @@ async def main():
             await asyncio.sleep(0.25)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    try: asyncio.run(main())
+    except KeyboardInterrupt: pass

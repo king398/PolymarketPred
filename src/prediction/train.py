@@ -28,7 +28,7 @@ class CFG:
 
     input_window = 60 * 10
     output_window = 1
-    forecast_horizon = 120
+    forecast_horizon = 60 * 5
 
     batch_size = 64
     epochs = 10
@@ -223,7 +223,7 @@ def main():
     valid_loader = DataLoader(valid_dataset, batch_size=CFG.batch_size, shuffle=False, num_workers=os.cpu_count())
 
     # 6. Model Setup
-    model = BiLSTMPriceForecast(n_features=len(feature_cols), hidden_size=128, num_layers=2, z=1)
+    model = BiLSTMPriceForecast(n_features=len(feature_cols), hidden_size=128, num_layers=3, z=CFG.output_window)
     model = model.to(CFG.device)
 
     optimizer = optim.Adam(model.parameters(), lr=CFG.learning_rate)

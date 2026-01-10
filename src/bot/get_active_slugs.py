@@ -45,6 +45,7 @@ BINANCE_MAP = {
     "doge": "DOGEUSDT", "dogecoin": "DOGEUSDT",
 }
 
+
 # -----------------------------------------------------------------------------
 # UTILITIES
 # -----------------------------------------------------------------------------
@@ -52,13 +53,16 @@ BINANCE_MAP = {
 def get_current_et():
     return datetime.now(ET)
 
+
 def to_utc_ms(dt_str: str) -> int:
     """Converts ISO string to UTC timestamp in ms."""
     dt = datetime.fromisoformat(dt_str)
     return int(dt.astimezone(timezone.utc).timestamp() * 1000)
 
+
 def now_ms() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)
+
 
 def extract_strike_from_slug(slug: str) -> Optional[float]:
     """
@@ -87,6 +91,7 @@ def extract_strike_from_slug(slug: str) -> Optional[float]:
     except Exception:
         return None
 
+
 def infer_binance_symbol(slug: str, question: str) -> Optional[str]:
     """Guesses Binance ticker from slug/question."""
     slug_lower = slug.lower()
@@ -96,6 +101,7 @@ def infer_binance_symbol(slug: str, question: str) -> Optional[str]:
         if f"{key}-" in slug_lower or key in q_lower:
             return val
     return None
+
 
 def generate_buckets(interval, count) -> List[Tuple[str, datetime]]:
     """Generates time strings for URL slugs."""
@@ -125,16 +131,19 @@ def generate_buckets(interval, count) -> List[Tuple[str, datetime]]:
         buckets.append((fmt_func(dt), dt))
     return buckets
 
+
 def parse_tokens(market):
     raw = market.get("clobTokenIds")
     if isinstance(raw, str): raw = ast.literal_eval(raw)
     if raw and len(raw) >= 2: return raw[0]
     return None
 
+
 def parse_prices(market):
     raw = market.get("outcomePrices")
     if isinstance(raw, str): return ast.literal_eval(raw)
     return [float(p) for p in raw]
+
 
 # -----------------------------------------------------------------------------
 # MARKET DISCOVERY (PRODUCER)
@@ -149,6 +158,7 @@ async def fetch_slug(session, slug):
     except Exception:
         pass
     return None
+
 
 async def process_weekly_markets(session, count):
     tasks = []
@@ -191,6 +201,7 @@ async def process_weekly_markets(session, count):
             except Exception:
                 continue
     return results
+
 
 async def process_standard_markets(session, category, symbols, interval, count, pattern):
     tasks = []
@@ -238,6 +249,7 @@ async def process_standard_markets(session, category, symbols, interval, count, 
             continue
     return results
 
+
 # -----------------------------------------------------------------------------
 # BINANCE FETCHER (CONSUMER)
 # -----------------------------------------------------------------------------
@@ -264,6 +276,7 @@ async def fetch_binance_candle(session, symbol: str, open_ms: int) -> Optional[D
             pass
         await asyncio.sleep(2)
     return None
+
 
 async def fulfill_market(market_data: Dict, processed_set: set):
     """Waits for start time + 60s, fetches binance price, writes to output."""
@@ -326,6 +339,7 @@ async def fulfill_market(market_data: Dict, processed_set: set):
     else:
         log.warning(f"⚠️ Candle miss: {slug}")
 
+
 # -----------------------------------------------------------------------------
 # MAIN LOOPS
 # -----------------------------------------------------------------------------
@@ -343,15 +357,15 @@ async def discovery_loop(queue: asyncio.Queue, seen_ids: set):
                 new_batch.extend(await process_standard_markets(
                     session, "1h", SYMBOLS_LONG, "1h", 2, "{symbol}-up-or-down-{param}-et"
                 ))
-                """new_batch.extend(await process_standard_markets(
+                new_batch.extend(await process_standard_markets(
                     session, "4h", SYMBOLS_SHORT, "4h", 1, "{symbol}-updown-4h-{param}"
-                ))"""
+                ))
                 new_batch.extend(await process_standard_markets(
                     session, "1d", SYMBOLS_LONG, "1d", 2, "{symbol}-up-or-down-on-{param}"
                 ))
 
                 # 2. Weekly Markets
-                #new_batch.extend(await process_weekly_markets(session, 9))
+                # new_batch.extend(await process_weekly_markets(session, 9))
 
                 # 3. Process Batch
                 added_count = 0
@@ -374,6 +388,7 @@ async def discovery_loop(queue: asyncio.Queue, seen_ids: set):
 
         await asyncio.sleep(10)
 
+
 async def processing_loop(queue: asyncio.Queue, processed_strikes: set):
     """Reads from queue and spawns background tasks to wait/fetch strikes."""
     log.info("[System] Processing Loop Started")
@@ -381,6 +396,7 @@ async def processing_loop(queue: asyncio.Queue, processed_strikes: set):
         market = await queue.get()
         asyncio.create_task(fulfill_market(market, processed_strikes))
         queue.task_done()
+
 
 # -----------------------------------------------------------------------------
 # ENTRY POINT
@@ -397,7 +413,8 @@ async def main():
                 try:
                     d = json.loads(line)
                     if 'clob_token_id' in d: seen_ids.add(d['clob_token_id'])
-                except: pass
+                except:
+                    pass
 
     # Load Completed Strikes
     if os.path.exists(CANDLE_OUTPUT_FILE):
@@ -406,7 +423,8 @@ async def main():
                 try:
                     d = json.loads(line)
                     if 'clob_token_id' in d: processed_strikes.add(d['clob_token_id'])
-                except: pass
+                except:
+                    pass
 
     log.info(f"Loaded {len(seen_ids)} known markets and {len(processed_strikes)} captured strikes.")
 
@@ -420,7 +438,8 @@ async def main():
                     cid = m.get('clob_token_id')
                     if cid and cid not in processed_strikes:
                         queue.put_nowait(m)
-                except: pass
+                except:
+                    pass
 
     log.info(f"Queued {queue.qsize()} pending markets from file history.")
 
@@ -428,6 +447,7 @@ async def main():
         discovery_loop(queue, seen_ids),
         processing_loop(queue, processed_strikes)
     )
+
 
 if __name__ == "__main__":
     try:
