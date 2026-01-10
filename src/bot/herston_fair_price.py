@@ -39,7 +39,7 @@ ZMQ_ADDR = "tcp://127.0.0.1:5567"
 BINANCE_WS = "wss://stream.binance.com:9443/stream?streams=btcusdt@trade/ethusdt@trade/solusdt@trade/xrpusdt@trade"
 
 # --- STRATEGY PARAMETERS ---
-MIN_VELOCITY_BUY = 0.05  # How fast price must be moving up to buy
+MIN_VELOCITY_BUY = 0.005  # How fast price must be moving up to buy
 MAX_SPREAD = 0.08  # Max difference between Bid/Ask to allow entry
 MAX_POS_SIZE = 100.0  # Dollars per trade
 TAKER_FEE_PCT = 0.0125  # 1% Fee (Standard Taker Fee)
