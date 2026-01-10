@@ -57,7 +57,7 @@ SCALP_TARGET_ROI = 0.04     # Target 4% profit per trade
 SPREAD_RATIO_LIMIT = 0.5    # Spread must be < 50% of the target profit amount
 
 # Vega Filtering (OTM Protection)
-ENABLE_VEGA_FILTER = True
+ENABLE_VEGA_FILTER = False
 MIN_VEGA_ATM = 0.02         # Lower sensitivity requirement for scalping
 VEGA_DIST_SCALER = 1.5      # Relaxed OTM penalty
 
