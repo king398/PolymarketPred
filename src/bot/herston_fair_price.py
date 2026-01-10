@@ -1,13 +1,11 @@
 """
-BATES-MODEL Z-SCORE ARBITRAGE (YES-ONLY)
-- STRATEGY: Mean Reversion on Model vs Market Residuals.
-- SIGNAL: Z-Score of (Mid_Price - Model_Price).
-- ENTRY: Buy YES when Z < -1.5 (Market is statistically cheap).
-- EXIT:  Sell YES when Z >= 0.25 (Mispricing corrected).
-- FILTER: Only trades YES. No short selling/NO shares.
-- FIXES: Async loading, ZMQ polling, Non-blocking UI.
-- ADDED: Live Z-Score Dashboard Column.
-- UPDATE: Hides finished/expired markets from the dashboard.
+STRATEGY: SPOT-DRIVEN LATENCY SCALPER (HFT)
+- CORE LOGIC: Arbitrage the time delay between Binance Spot moves and Prediction Market updates.
+- SIGNAL: Instant Gap = (Heston_Fair_Value - Market_Price).
+- SPEED: Reacts immediately to Spot volatility. No history/windows.
+- STYLE: Aggressive Taker.
+- ENTRY: Buy YES if Fair_Value > Ask + Min_Edge.
+- EXIT: Sell YES immediately if Fair_Value < Bid (Edge gone).
 """
 
 import time
@@ -30,88 +28,49 @@ from rich.text import Text
 from rich import box
 
 # --- MODEL IMPORT ---
-# Ensure heston_model.py is in the same directory
 try:
     from heston_model import FastHestonModel
 except ImportError:
-    # Dummy mock for demonstration if file is missing
     class FastHestonModel:
         @staticmethod
         def price_binary_call(S, K, T, T_total, params):
-            return 0.50
+            # Dummy pricing if file missing
+            d = (S - K)
+            return 0.5 + (d * 0.001)
 
 warnings.filterwarnings("ignore")
 
 # ==============================================================================
-# 0. CONFIGURATION
+# 0. HFT CONFIGURATION
 # ==============================================================================
 ZMQ_ADDR = "tcp://127.0.0.1:5567"
 BINANCE_API = "https://api.binance.com/api/v3/ticker/price"
+
+# --- SCALPING PARAMS ---
+MIN_EDGE_TO_ENTER = 0.025   # We need 2.5% edge (covers fees + slippage + profit)
+MIN_EDGE_TO_HOLD = 0.005    # If edge drops below 0.5%, we dump the position
+MAX_SPREAD = 0.10           # Don't trade illiquid garbage
+MAX_POS_SIZE = 200.0        # Max capital per trade (Aggressive sizing)
+MAX_TOTAL_RISK = 5000.0     # Max total inventory
+REFRESH_RATE = 0.1          # 100ms eval loop
 
 # File Paths
 DATA_DIR = os.path.join(os.getcwd(), "data")
 ASSET_ID_FILE = os.path.join(DATA_DIR, "clob_token_ids.jsonl")
 PARAMS_FILE = os.path.join(DATA_DIR, "bates_params_digital.jsonl")
 STRIKES_FILE = os.path.join(DATA_DIR, "market_1m_candle_opens.jsonl")
-TRADES_LOG_FILE = os.path.join(DATA_DIR, "sim_trade_history.csv")
+TRADES_LOG_FILE = os.path.join(DATA_DIR, "hft_scalp_log.csv")
 
-# --- Z-SCORE STRATEGY PARAMS ---
-ENTRY_Z_SCORE = -1.5   # Buy YES when Market is 1.5 sigma BELOW Model
-EXIT_Z_SCORE = 0.25    # Exit when Market returns near Model price
-ROLLING_WINDOW = 600   # Ticks to calculate volatility of the residual
-MIN_HISTORY = 180       # Warmup ticks before trading
-MAX_SPREAD = 0.08      # Max Bid/Ask spread allowed
-MAX_POS_SIZE = 100.0   # Max capital per trade
-SLIPPAGE = 0.0002
-CHUNK_PCT = 0.2
-CHUNK_DELAY = 1.0
-
-# Time Constants
+# Constants
 YEAR_MS = 365 * 24 * 3600 * 1000
-DURATION_MAP = {"15m": 15 / (60 * 24 * 365), "1h": 1 / (24 * 365), "4h": 4 / (24 * 365), "1d": 1 / 365}
+DURATION_MAP = {"15m": 15/(60*24*365), "1h": 1/(24*365), "4h": 4/(24*365), "1d": 1/365}
 
-# --- DATA STRUCTURES ---
-tick_dtype = np.dtype([
-    ("ts_ms", np.int64),
-    ("bid", np.float32),
-    ("ask", np.float32),
-])
-
+tick_dtype = np.dtype([("ts_ms", np.int64), ("bid", np.float32), ("ask", np.float32)])
 state_ticks = {}
 
 
 # ==============================================================================
-# 1. STATISTICS ENGINE
-# ==============================================================================
-class RollingStats:
-    """
-    Tracks the rolling Mean and StdDev of the 'Residual' (Market Mid - Model Prob).
-    """
-    def __init__(self, window_size=300):
-        self.window = window_size
-        self.values = deque(maxlen=window_size)
-
-    def update(self, val):
-        self.values.append(val)
-
-    def get_stats(self):
-        """Returns (mean, std_dev) of the rolling window."""
-        if len(self.values) < MIN_HISTORY:
-            return 0.0, 0.0
-        arr = np.array(self.values)
-        return np.mean(arr), np.std(arr)
-
-    def get_z_score(self, current_val):
-        mean, std = self.get_stats()
-        if std < 1e-6: return 0.0
-        return (current_val - mean) / std
-
-    def ready(self):
-        return len(self.values) >= MIN_HISTORY
-
-
-# ==============================================================================
-# 2. DATA MANAGEMENT
+# 1. DATA MANAGER
 # ==============================================================================
 class DataManager:
     def __init__(self):
@@ -122,7 +81,7 @@ class DataManager:
         self.symbol_map = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT", "XRP": "XRPUSDT"}
 
     def _load_sync(self):
-        # Load Model Params
+        # 1. Load Params
         if os.path.exists(PARAMS_FILE):
             with open(PARAMS_FILE, "r") as f:
                 for line in f:
@@ -131,7 +90,7 @@ class DataManager:
                         self.bates_params[p['currency']] = p
                     except: pass
 
-        # Load Strikes
+        # 2. Load Strikes
         if os.path.exists(STRIKES_FILE):
             with open(STRIKES_FILE, "r") as f:
                 for line in f:
@@ -141,7 +100,7 @@ class DataManager:
                             self.strikes[obj["clob_token_id"]] = float(obj["strike_price"])
                     except: pass
 
-        # Load Metadata
+        # 3. Load Metadata
         if os.path.exists(ASSET_ID_FILE):
             with open(ASSET_ID_FILE, "r") as f:
                 for line in f:
@@ -153,421 +112,243 @@ class DataManager:
                         if 'bitcoin' in slug or 'btc' in slug: underlying = "BTC"
                         elif 'ethereum' in slug or 'eth' in slug: underlying = "ETH"
                         elif 'solana' in slug or 'sol' in slug: underlying = "SOL"
-                        elif 'xrp' in slug: underlying = "XRP"
 
                         if underlying and m.get('clob_token_id'):
                             dt = datetime.fromisoformat(m['market_end'].replace('Z', '+00:00'))
-                            t_years = DURATION_MAP.get(m.get('category', '1h'), 1 / (24 * 365))
+                            t_years = DURATION_MAP.get(m.get('category', '1h'), 1/(24*365))
                             self.clob_map[m['clob_token_id']] = {
                                 "question": m.get('question', m.get('slug')),
                                 "underlying": underlying,
                                 "end_ts_ms": int(dt.timestamp() * 1000),
-                                "initial_T": t_years,
-                                "initial_duration_ms": t_years * YEAR_MS
+                                "initial_T": t_years
                             }
                     except: pass
 
     async def watch_metadata(self):
         loop = asyncio.get_event_loop()
         while True:
-            # Run heavy load in thread executor
             await loop.run_in_executor(None, self._load_sync)
-            await asyncio.sleep(5)
+            await asyncio.sleep(10)
 
-    async def update_spot_prices(self):
+    async def stream_spot_prices(self):
+        """High frequency polling for Spot Prices"""
         while True:
             try:
                 for sym, ticker in self.symbol_map.items():
-                    r = requests.get(BINANCE_API, params={"symbol": ticker}, timeout=2)
-                    if r.status_code == 200: self.spot_prices[sym] = float(r.json()['price'])
+                    r = requests.get(BINANCE_API, params={"symbol": ticker}, timeout=1)
+                    if r.status_code == 200:
+                        self.spot_prices[sym] = float(r.json()['price'])
             except: pass
-            await asyncio.sleep(1.0)
-
+            await asyncio.sleep(0.5) # Poll every 500ms
 
 # ==============================================================================
-# 3. TRADING ENGINE
+# 2. SCALPING ENGINE
 # ==============================================================================
 class Position:
-    def __init__(self, asset_id, side, strike, model_prob, entry_z, entry_spot):
+    def __init__(self, asset_id, entry_px, fair_at_entry):
         self.asset_id = asset_id
-        self.side = side
-        self.strike = strike
-        self.initial_model_prob = model_prob
-        self.initial_spot = entry_spot
-        self.entry_z = entry_z
-        self.avg_entry_px = 0.0
-        self.size_qty = 0.0
-        self.cost_basis = 0.0
-        self.start_ts = time.time()
-        self.target_cost = MAX_POS_SIZE
-        self.last_fill_ts = 0
-        self.is_accumulating = True
+        self.entry_px = entry_px
+        self.qty = MAX_POS_SIZE / entry_px
+        self.cost_basis = MAX_POS_SIZE
+        self.fair_at_entry = fair_at_entry
+        self.timestamp = time.time()
 
-class SimulatedTrader:
+class ScalperBot:
     def __init__(self, data_manager: DataManager):
         self.dm = data_manager
-        self.balance = 2000.0
-        self.positions = []
+        self.cash = 5000.0
+        self.positions = {} # dict {asset_id: Position}
         self.realized_pnl = 0.0
-        self.logs = deque(maxlen=20)
-        self.residuals = {}
-
-        # --- NEW: Store Live Analytics for UI ---
+        self.logs = deque(maxlen=15)
         self.live_analytics = {}
-
         self._init_csv()
 
     def _init_csv(self):
         if not os.path.exists(TRADES_LOG_FILE):
-            try:
-                with open(TRADES_LOG_FILE, mode='w', newline='') as f:
-                    csv.writer(f).writerow([
-                        "timestamp", "action", "question", "side", "price",
-                        "fair_value", "z_score", "spot", "sigma", "pnl", "reason"
-                    ])
-            except: pass
+            with open(TRADES_LOG_FILE, 'w', newline='') as f:
+                csv.writer(f).writerow(["timestamp", "action", "symbol", "price", "fair", "spot", "pnl"])
 
-    def _save_trade(self, action, pos, price, model_p, z, spot, sigma, pnl, reason, q_text):
-        try:
-            with open(TRADES_LOG_FILE, mode='a', newline='') as f:
-                csv.writer(f).writerow([
-                    datetime.now().isoformat(), action, q_text, pos.side,
-                    f"{price:.4f}", f"{model_p:.4f}", f"{z:.2f}",
-                    f"{spot:.2f}", f"{sigma:.4f}",
-                    f"{pnl:.4f}" if pnl else "", reason
-                ])
-        except: pass
+    def log(self, msg, color="white"):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.logs.append((ts, msg, color))
 
-    def log(self, msg, style="white"):
-        self.logs.append((time.strftime("%H:%M:%S"), msg, style))
-
-    def get_position(self, aid):
-        for p in self.positions:
-            if p.asset_id == aid: return p
-        return None
-
-    def evaluate(self, aid, market_bid, market_ask):
+    def evaluate(self, aid, bid, ask):
         meta = self.dm.clob_map.get(aid)
         strike = self.dm.strikes.get(aid)
         if not (meta and strike): return
 
-        # 1. Market Data
-        now_ms = int(time.time() * 1000)
-        rem_ms = meta['end_ts_ms'] - now_ms
-        if rem_ms <= 0: return
-
-        mid_price = (market_bid + market_ask) / 2
-        spread = market_ask - market_bid
-
-        # 2. Model Price
         spot = self.dm.spot_prices.get(meta['underlying'])
         params = self.dm.bates_params.get(meta['underlying'])
         if not (spot and params): return
 
+        # 1. Calculate Instant Fair Value
+        now_ms = time.time() * 1000
+        rem_ms = meta['end_ts_ms'] - now_ms
+        if rem_ms <= 0: return
+
         T_years = rem_ms / (1000 * 365 * 24 * 3600.0)
-        model_p = FastHestonModel.price_binary_call(spot, strike, T_years, meta['initial_T'], params)
+        fair_price = FastHestonModel.price_binary_call(spot, strike, T_years, meta['initial_T'], params)
 
-        # 3. Z-Score Calculation
-        residual = mid_price - model_p
+        # 2. Store Analytics for UI
+        spread = ask - bid
+        buy_edge = fair_price - ask
+        sell_edge = bid - fair_price # For exiting long
 
-        if aid not in self.residuals: self.residuals[aid] = RollingStats(ROLLING_WINDOW)
-        stats = self.residuals[aid]
-        stats.update(residual)
-
-        if not stats.ready():
-            # Store partial data even if not ready to trade
-            self.live_analytics[aid] = {
-                "fair": model_p,
-                "z": 0.0,
-                "residual": residual,
-                "ready": False
-            }
-            return
-
-        mean_resid, sigma = stats.get_stats()
-        if sigma < 1e-6: sigma = 0.001
-
-        z_score = (residual - mean_resid) / sigma
-
-        # --- NEW: Update Live Analytics for UI ---
         self.live_analytics[aid] = {
-            "fair": model_p,
-            "z": z_score,
-            "residual": residual,
-            "ready": True
+            "fair": fair_price,
+            "buy_edge": buy_edge,
+            "sell_edge": sell_edge,
+            "spot": spot
         }
 
-        pos = self.get_position(aid)
+        # 3. TRADING LOGIC
+        pos = self.positions.get(aid)
 
-        # --- TRADING LOGIC ---
         if pos:
-            # Accumulate
-            if pos.is_accumulating:
-                if (time.time() - pos.last_fill_ts) > CHUNK_DELAY:
-                    if z_score < (ENTRY_Z_SCORE + 0.5) and spread < MAX_SPREAD:
-                        self._execute_chunk(pos, market_ask, model_p, spot, sigma, meta['question'], z_score)
-                    else:
-                        pos.is_accumulating = False
+            # --- EXIT LOGIC ---
+            # If our edge has evaporated (or reversed), DUMP IT.
+            # We don't wait for profit target, we wait for edge decay.
+            current_hold_value = fair_price - bid
 
-            # Exit Logic
-            if z_score >= EXIT_Z_SCORE:
-                self._close_position(pos, market_bid, model_p, spot, sigma, meta['question'], z_score, "MEAN_REV")
+            # Logic: If fair price is now LOWER than bid (market is overpaying), SELL.
+            # Or if the edge is just too small to justify risk (< 0.5%)
+            if fair_price < bid or (fair_price - bid) < MIN_EDGE_TO_HOLD:
+                self._execute_sell(pos, bid, fair_price, spot, meta['question'])
 
-        elif spread < MAX_SPREAD:
-            # Entry Logic
-            if z_score < ENTRY_Z_SCORE:
-                self._start_position(aid, "YES", market_ask, strike, model_p, spot, sigma, meta['question'], z_score)
+        else:
+            # --- ENTRY LOGIC ---
+            # Buy if Fair Value is significantly higher than Ask (Market Lagging Upward Move)
+            if buy_edge > MIN_EDGE_TO_ENTER and spread < MAX_SPREAD:
+                if self.cash > MAX_POS_SIZE:
+                    self._execute_buy(aid, ask, fair_price, spot, meta['question'])
 
-    def _start_position(self, aid, side, price, strike, model_p, spot, sigma, q_text, z):
-        if price > 0.98 or price < 0.02: return
-        pos = Position(aid, side, strike, model_p, z, spot)
-        self.positions.append(pos)
-        self._execute_chunk(pos, price, model_p, spot, sigma, q_text, z)
+    def _execute_buy(self, aid, price, fair, spot, question):
+        if price >= 0.99: return
+        pos = Position(aid, price, fair)
+        self.positions[aid] = pos
+        self.cash -= pos.cost_basis
 
-    def _execute_chunk(self, pos, price, model_p, spot, sigma, q_text, z):
-        remaining = pos.target_cost - pos.cost_basis
-        chunk = min(remaining, MAX_POS_SIZE * CHUNK_PCT, self.balance)
-        if chunk < 5.0: pos.is_accumulating = False; return
+        # Log
+        edge_pct = ((fair - price)/price)*100
+        self.log(f"BUY  | {question[:20]} | Gap: {edge_pct:.1f}% | Spot: {spot:.1f}", "bold green")
+        self._write_csv("BUY", question, price, fair, spot, 0)
 
-        price = float(price + SLIPPAGE)
-        qty = chunk / price
-        self.balance -= chunk
-        pos.cost_basis += chunk
-        pos.size_qty += qty
-        pos.avg_entry_px = pos.cost_basis / pos.size_qty
-        pos.last_fill_ts = time.time()
-
-        resid = price - model_p
-        msg = (f"[BUY YES] {q_text[:30]}...\n"
-               f"   >> Px:{price:.3f} | Fair:{model_p:.3f} | Resid:{resid:+.3f}\n"
-               f"   >> Z:{z:.2f}    | Vol:{sigma:.3f}  | Spot:${spot:,.2f}")
-
-        self.log(msg, style="green")
-        self._save_trade("BUY", pos, price, model_p, z, spot, sigma, None, "ENTRY", q_text)
-
-    def _close_position(self, pos, price, model_p, spot, sigma, q_text, z, reason):
-        price = float(price - SLIPPAGE)
-        proceeds = pos.size_qty * price
+    def _execute_sell(self, pos, price, fair, spot, question):
+        proceeds = pos.qty * price
         pnl = proceeds - pos.cost_basis
-
-        self.balance += proceeds
+        self.cash += proceeds
         self.realized_pnl += pnl
-        self.positions.remove(pos)
+        del self.positions[pos.asset_id]
 
-        color = "bold green" if pnl > 0 else "bold red"
-        spot_delta = spot - pos.initial_spot
-        spot_pct = (spot_delta / pos.initial_spot) * 100
+        color = "bold cyan" if pnl > 0 else "bold red"
+        self.log(f"SELL | {question[:20]} | PnL: ${pnl:.2f} | Spot: {spot:.1f}", color)
+        self._write_csv("SELL", question, price, fair, spot, pnl)
 
-        msg = (f"[SELL YES] {q_text[:30]}...\n"
-               f"   >> Exit:{price:.3f} | Fair:{model_p:.3f} | Spot:${spot:,.2f} ({spot_pct:+.1f}%)\n"
-               f"   >> Z:{z:.2f}     | PnL:${pnl:.2f} | Reason:{reason}")
-
-        self.log(msg, style=color)
-        self._save_trade("SELL", pos, price, model_p, z, spot, sigma, pnl, reason, q_text)
-
+    def _write_csv(self, side, sym, px, fair, spot, pnl):
+        with open(TRADES_LOG_FILE, 'a', newline='') as f:
+            csv.writer(f).writerow([datetime.now().isoformat(), side, sym, px, fair, spot, pnl])
 
 # ==============================================================================
-# 4. LAYOUT / UI GENERATION (INLINED)
+# 3. HIGH-SPEED DASHBOARD
 # ==============================================================================
-def format_time_remaining(end_ts_ms):
-    now = time.time() * 1000
-    diff = (end_ts_ms - now) / 1000
-    if diff < 0: return "ENDED"
-    hours = int(diff // 3600)
-    mins = int((diff % 3600) // 60)
-    return f"{hours}h {mins}m"
-
-def make_layout(trader, state_ticks):
-    """
-    Generates the Rich layout with the Live Z-Score Column.
-    """
+def make_layout(bot):
     layout = Layout()
 
-    # --- Header Table (Portfolio) ---
-    header_table = Table(box=box.SIMPLE_HEAD, expand=True, show_header=True)
-    header_table.add_column("Metric", style="dim")
-    header_table.add_column("Value", style="bold white")
-    header_table.add_column("Metric", style="dim")
-    header_table.add_column("Value", style="bold white")
-
-    total_positions = len(trader.positions)
-    total_invested = sum(p.cost_basis for p in trader.positions)
-
-    header_table.add_row(
-        "Cash Balance", f"${trader.balance:.2f}",
-        "Realized PnL", f"${trader.realized_pnl:.2f}"
-    )
-    header_table.add_row(
-        "Open Positions", str(total_positions),
-        "Invested", f"${total_invested:.2f}"
+    # Metrics
+    table_header = Table(box=box.SIMPLE, show_header=False, expand=True)
+    table_header.add_row(
+        f"CASH: [bold green]${bot.cash:.2f}[/]",
+        f"PNL: [bold yellow]${bot.realized_pnl:.2f}[/]",
+        f"ACTIVE SCALPS: [bold white]{len(bot.positions)}[/]"
     )
 
-    # --- Market Monitor Table ---
-    market_table = Table(
-        title="LIVE MARKET MONITOR & Z-SCORE ARBITRAGE",
-        box=box.SIMPLE,
-        expand=True,
-        header_style="bold cyan"
-    )
+    # Market Grid
+    table_mkt = Table(title="LATENCY SCALPER (Spot vs Model Gap)", box=box.SIMPLE_HEAD, expand=True)
+    table_mkt.add_column("Market", ratio=3)
+    table_mkt.add_column("Spot", justify="right")
+    table_mkt.add_column("Mkt Ask", justify="right", style="red")
+    table_mkt.add_column("Fair Val", justify="right", style="cyan")
+    table_mkt.add_column("Gap (Edge)", justify="right", style="bold")
+    table_mkt.add_column("Status", justify="center")
 
-    market_table.add_column("Question", ratio=4)
-    market_table.add_column("Time", justify="right", width=8)
-    market_table.add_column("Bid", justify="right", width=6, style="green")
-    market_table.add_column("Ask", justify="right", width=6, style="red")
-    market_table.add_column("Fair", justify="right", width=6, style="yellow")
-    market_table.add_column("Edge", justify="right", width=8)
-    market_table.add_column("Z-Score", justify="right", width=8) # <--- NEW COLUMN
-    market_table.add_column("Pos (Shares)", justify="center", width=12)
-    market_table.add_column("Unreal PnL", justify="right", width=10)
+    sorted_aids = sorted(bot.live_analytics.keys(), key=lambda x: bot.live_analytics[x]['buy_edge'], reverse=True)
 
-    # Sort active markets by Liquidity (roughly) or Activity
-    active_aids = list(state_ticks.keys())
-
-    for aid in active_aids:
-        ticks = state_ticks[aid]
-        if len(ticks) == 0: continue
-
-        bid = ticks['bid'][-1]
-        ask = ticks['ask'][-1]
-
-        meta = trader.dm.clob_map.get(aid)
+    for aid in sorted_aids[:12]: # Show top 12 opps
+        data = bot.live_analytics[aid]
+        meta = bot.dm.clob_map.get(aid)
         if not meta: continue
 
-        # --- FIX: FILTER OUT FINISHED MARKETS ---
-        now_ms = time.time() * 1000
-        if meta['end_ts_ms'] <= now_ms:
-            continue
-        # ----------------------------------------
+        # Edge Coloring
+        edge = data['buy_edge']
+        edge_style = "dim white"
+        if edge > MIN_EDGE_TO_ENTER: edge_style = "bold green blink"
+        elif edge < 0: edge_style = "red"
 
-        q_text = meta['question']
-        time_rem = format_time_remaining(meta['end_ts_ms'])
+        # Status
+        status = "-"
+        if aid in bot.positions:
+            pnl_unreal = (data['fair'] - bot.positions[aid].entry_px) * bot.positions[aid].qty
+            c = "green" if pnl_unreal > 0 else "red"
+            status = f"[{c}]OPEN ${pnl_unreal:.1f}[/{c}]"
 
-        # Analytics
-        analytics = trader.live_analytics.get(aid, {})
-        fair_val = analytics.get('fair', 0.0)
-        edge = analytics.get('residual', 0.0)
-        z_score = analytics.get('z', 0.0)
-        is_ready = analytics.get('ready', False)
-
-        # Formatting Z-Score
-        z_str = f"{z_score:.2f}"
-        z_style = "dim white"
-        if is_ready:
-            if z_score <= ENTRY_Z_SCORE: z_style = "bold green" # Buy Signal
-            elif z_score >= EXIT_Z_SCORE: z_style = "bold red"  # Sell Signal
-        else:
-            z_str = "Wait" # Warming up
-
-        # Formatting Edge
-        edge_str = f"{edge:+.3f}"
-        edge_style = "green" if edge > 0 else "red"
-
-        # Position Info
-        pos = trader.get_position(aid)
-        pos_str = "-"
-        pnl_str = "-"
-
-        if pos:
-            pos_str = f"{int(pos.size_qty)}"
-            # Est PnL based on mid
-            mid = (bid + ask) / 2
-            unreal = (pos.size_qty * mid) - pos.cost_basis
-            pnl_color = "green" if unreal > 0 else "red"
-            pnl_str = f"[{pnl_color}]{unreal:+.2f}[/{pnl_color}]"
-
-        market_table.add_row(
-            q_text,
-            time_rem,
-            f"{bid:.3f}",
-            f"{ask:.3f}",
-            f"{fair_val:.3f}",
-            f"[{edge_style}]{edge_str}[/{edge_style}]",
-            f"[{z_style}]{z_str}[/{z_style}]",
-            pos_str,
-            pnl_str
+        table_mkt.add_row(
+            meta['question'][:35],
+            f"{data['spot']:.1f}",
+            f"{state_ticks.get(aid, np.zeros(1, dtype=tick_dtype))['ask'][-1]:.3f}",
+            f"{data['fair']:.3f}",
+            f"[{edge_style}]{edge:+.3f}[/{edge_style}]",
+            status
         )
 
-    # --- Logs Panel ---
-    log_text = Text()
-    for t, msg, style in trader.logs:
-        log_text.append(f"{t} ", style="dim")
-        log_text.append(msg + "\n", style=style)
+    # Logs
+    log_txt = Text()
+    for t, m, c in bot.logs:
+        log_txt.append(f"[{t}] {m}\n", style=c)
 
-    # Compose Layout
     layout.split(
-        Layout(Panel(header_table, title="Portfolio"), size=8),
-        Layout(market_table, name="body"),
-        Layout(Panel(log_text, title="Trade Logs", border_style="blue"), size=10)
+        Layout(Panel(table_header, title="Wallet"), size=5),
+        Layout(table_mkt),
+        Layout(Panel(log_txt, title="Scalp Log"), size=8)
     )
-
     return layout
 
-
 # ==============================================================================
-# 5. ASYNC LOOP
+# 4. MAIN LOOP
 # ==============================================================================
-async def zmq_loop(trader):
-    """
-    Polls ZMQ with a timeout to prevent blocking the Event Loop.
-    """
+async def zmq_listener(bot):
     ctx = zmq.asyncio.Context.instance()
     sub = ctx.socket(zmq.SUB)
     sub.connect(ZMQ_ADDR)
     sub.subscribe(b"")
 
-    poller = zmq.asyncio.Poller()
-    poller.register(sub, zmq.POLLIN)
-
     while True:
         try:
-            events = await poller.poll(timeout=100)
-            if sub in dict(events):
-                aid, payload = await sub.recv_multipart()
-                arr = np.frombuffer(payload, dtype=tick_dtype)
-                state_ticks[aid.decode()] = arr
-                if len(arr) > 0:
-                    trader.evaluate(aid.decode(), float(arr['bid'][-1]), float(arr['ask'][-1]))
-
+            aid, payload = await sub.recv_multipart()
+            arr = np.frombuffer(payload, dtype=tick_dtype)
+            if len(arr) > 0:
+                aid_str = aid.decode()
+                state_ticks[aid_str] = arr
+                bot.evaluate(aid_str, float(arr['bid'][-1]), float(arr['ask'][-1]))
+        except Exception:
             await asyncio.sleep(0.01)
 
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
+async def main():
+    dm = DataManager()
+    bot = ScalperBot(dm)
+
+    # Background Tasks
+    asyncio.create_task(dm.watch_metadata())
+    asyncio.create_task(dm.stream_spot_prices())
+    asyncio.create_task(zmq_listener(bot))
+
+    # Give it a second to warm up
+    print("Warming up models...")
+    await asyncio.sleep(2)
+
+    with Live(make_layout(bot), refresh_per_second=10, screen=True) as live:
+        while True:
+            live.update(make_layout(bot))
             await asyncio.sleep(0.1)
 
-async def main():
-    print("--- STARTING TRADER ---")
-    dm = DataManager()
-
-    # 1. Load Data in Background (Non-Blocking)
-    print("Loading Metadata (this may take 10-20 seconds)...")
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, dm._load_sync)
-    print(f"Loaded {len(dm.clob_map)} assets.")
-
-    trader = SimulatedTrader(dm)
-
-    # 2. Launch Tasks
-    t1 = asyncio.create_task(dm.update_spot_prices())
-    t2 = asyncio.create_task(zmq_loop(trader))
-    t3 = asyncio.create_task(dm.watch_metadata())
-
-    print("Entering Live Dashboard...")
-    try:
-        # Pass both trader and state_ticks to the layout
-        with Live(make_layout(trader, state_ticks), refresh_per_second=4, screen=True) as live:
-            while True:
-                live.update(make_layout(trader, state_ticks))
-                await asyncio.sleep(0.25)
-    except asyncio.CancelledError:
-        print("Stopping...")
-    finally:
-        t1.cancel()
-        t2.cancel()
-        t3.cancel()
-
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(main())

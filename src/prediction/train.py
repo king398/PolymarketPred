@@ -26,7 +26,7 @@ class CFG:
 
     lookback_buffer_size = 300
 
-    input_window = 60 * 10
+    input_window = 60 * 30
     output_window = 1
     forecast_horizon = 60 * 5
 
