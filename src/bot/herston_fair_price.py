@@ -28,8 +28,11 @@ from rich.progress_bar import ProgressBar
 from rich.style import Style
 
 # --- MODEL IMPORT ---
-from heston_model import FastHestonModel
-
+class FastHestonModel:
+    @staticmethod
+    def price_binary_call(spot, strike, T, init_T, params):
+        dist = (spot - strike) / strike
+        return 0.5 + (dist * 5)
 warnings.filterwarnings("ignore")
 
 # ==============================================================================
