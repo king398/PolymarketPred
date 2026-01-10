@@ -234,6 +234,9 @@ class DeltaBot:
     # ==========================================================================
     # MODIFIED: PURE MOMENTUM ENTRY
     # ==========================================================================
+    # ==========================================================================
+    # MODIFIED: PURE MOMENTUM ENTRY (WITH LATENCY LOGGING)
+    # ==========================================================================
     def check_entry(self, aid, fair, velocity, spot, question):
         # 1. VELOCITY CHECK
         if velocity < MIN_VELOCITY_BUY: return
@@ -241,14 +244,18 @@ class DeltaBot:
         # 2. SPREAD / MAX PRICE CHECK
         ticks = state_ticks.get(aid)
         if ticks is None or len(ticks) == 0: return
+
+        # --- LATENCY CALCULATION START ---
+        data_ts = float(ticks['ts_ms'][-1])
+        now_ms = time.time_ns() // 1_000_000
+        latency_ms = now_ms - data_ts
+        # ---------------------------------
+
         ask = float(ticks['ask'][-1])
         bid = float(ticks['bid'][-1])
 
         # Don't buy if spread is massive or price is near max
         if ask >= 0.90 or ask <= 0.1 or (ask - bid) > MAX_SPREAD: return
-
-        # --- REMOVED: VALUE GAP CHECK ---
-        # We now enter purely because velocity is high, regardless of "Fair Value"
 
         qty = MAX_POS_SIZE / ask
         self.positions[aid] = Position(aid, ask, qty)
@@ -257,24 +264,29 @@ class DeltaBot:
 
         details = (
             f"Momentum Entry @ {ask:.3f}\n"
-            f"Vel: {velocity:+.3f} (Req: >{MIN_VELOCITY_BUY})"
+            f"Vel: {velocity:+.3f} (Req: >{MIN_VELOCITY_BUY})\n"
+            f"Latency: {latency_ms:.1f}ms"  # Added Latency Here
         )
         self.log("BUY", f"Entered {question}", details, "bold green")
         self._write_csv("BUY", question, ask, velocity, "MOMENTUM_ENTRY", spot, 0)
-
     # ==========================================================================
     # MODIFIED: EXIT LOGIC (NO VALUE CHECK, ADDED CRASH GUARD)
     # ==========================================================================
+    # ==========================================================================
+    # MODIFIED: EXIT LOGIC (WITH LATENCY LOGGING)
+    # ==========================================================================
     def check_exit(self, aid, fair, velocity, spot, question):
         ticks = state_ticks.get(aid)
-        if ticks is None: return
+        if ticks is None or len(ticks) == 0: return
+
         bid = float(ticks['bid'][-1])
+        data_ts = float(ticks['ts_ms'][-1]) # Capture timestamp from data
+
         pos = self.positions[aid]
         reason = None
-        now = time.time()
+        now = time.time_ns() // 1_000_000
 
         # 1. CRASH GUARD (Negative Velocity)
-        # If momentum flips negative, sell immediately to protect gains/limit loss
         if velocity < MOMENTUM_FLIP_THRESH:
             reason = f"MOMENTUM FLIP: Vel {velocity:.3f} < {MOMENTUM_FLIP_THRESH}"
 
@@ -292,9 +304,15 @@ class DeltaBot:
                 del self.stagnation_start[aid]
 
         if reason:
-            self._execute_sell(aid, pos, bid, reason, velocity, fair, spot, question)
+            # Pass data_ts to execution
+            self._execute_sell(aid, pos, bid, reason, velocity, fair, spot, question, data_ts)
 
-    def _execute_sell(self, aid, pos, price, reason, velocity, fair, spot, question):
+    def _execute_sell(self, aid, pos, price, reason, velocity, fair, spot, question, data_ts):
+        # --- LATENCY CALCULATION START ---
+        now_ms = time.time_ns() // 1_000_000
+        latency_ms = now_ms - data_ts
+        # ---------------------------------
+
         proceeds = pos.qty * price
         pnl = proceeds - pos.cost
         roi = (pnl / pos.cost) * 100
@@ -313,11 +331,10 @@ class DeltaBot:
         details = (
             f"Exit Price: {price:.3f} | Entry: {pos.entry_px:.3f}\n"
             f"Reason: {reason}\n"
-            f"ROI: {roi:+.2f}%"
+            f"ROI: {roi:+.2f}% | Latency: {latency_ms:.1f}ms" # Added Latency Here
         )
         self.log("SELL", f"Closed {question}", details, c)
         self._write_csv("SELL", question, price, velocity, reason, spot, pnl)
-
     def _write_csv(self, action, sym, px, vel, reason, spot, pnl):
         with open(TRADES_LOG_FILE, 'a', newline='') as f:
             csv.writer(f).writerow([
