@@ -38,14 +38,14 @@ ZMQ_ADDR = "tcp://127.0.0.1:5567"
 BINANCE_WS = "wss://stream.binance.com:9443/stream?streams=btcusdt@trade/ethusdt@trade/solusdt@trade/xrpusdt@trade"
 
 # --- STRATEGY PARAMETERS ---
-MIN_VELOCITY_BUY = 0.10      # How fast price must be moving up to buy
-MAX_SPREAD = 0.08            # Max difference between Bid/Ask to allow entry
-MAX_POS_SIZE = 100.0         # Dollars per trade
+MIN_VELOCITY_BUY = 0.05  # How fast price must be moving up to buy
+MAX_SPREAD = 0.08  # Max difference between Bid/Ask to allow entry
+MAX_POS_SIZE = 100.0  # Dollars per trade
 
 # --- EXIT PARAMETERS ---
-STAG_TOLERANCE = 0.015       # Velocity close to 0 is stagnation
-STAG_LIMIT_SEC = 5.0         # Seconds to hold while stagnant
-MOMENTUM_FLIP_THRESH = -0.05 # Sell immediately if velocity drops below this
+STAG_TOLERANCE = 0.015  # Velocity close to 0 is stagnation
+STAG_LIMIT_SEC = 5.0  # Seconds to hold while stagnant
+MOMENTUM_FLIP_THRESH = -0.10  # Sell immediately if velocity drops below this
 
 # Files
 DATA_DIR = os.path.join(os.getcwd(), "data")
@@ -245,7 +245,7 @@ class DeltaBot:
         bid = float(ticks['bid'][-1])
 
         # Don't buy if spread is massive or price is near max
-        if ask >= 0.98 or (ask - bid) > MAX_SPREAD: return
+        if ask >= 0.90 or ask <= 0.1 or (ask - bid) > MAX_SPREAD: return
 
         # --- REMOVED: VALUE GAP CHECK ---
         # We now enter purely because velocity is high, regardless of "Fair Value"
@@ -301,8 +301,10 @@ class DeltaBot:
         self.cash += proceeds
         self.pnl += pnl
 
-        if pnl > 0: self.wins += 1
-        else: self.losses += 1
+        if pnl > 0:
+            self.wins += 1
+        else:
+            self.losses += 1
 
         del self.positions[aid]
         if aid in self.stagnation_start: del self.stagnation_start[aid]
@@ -429,8 +431,6 @@ def make_market_table(bot):
     active_ids = sorted(
         bot.live_dashboard.keys(),
         key=lambda x: (
-            0 if x in bot.positions else 1,
-            -abs(bot.live_dashboard[x]['velocity']),
             bot.dm.clob_map.get(x, {}).get('question', '')
         )
     )
@@ -462,8 +462,10 @@ def make_market_table(bot):
         moneyness_str = f"[{mon_style}]{dist_pct:+.2f}%[/]"
 
         v_style = "dim"
-        if vel > MIN_VELOCITY_BUY: v_style = "bold green"
-        elif vel < MOMENTUM_FLIP_THRESH: v_style = "bold red"
+        if vel > MIN_VELOCITY_BUY:
+            v_style = "bold green"
+        elif vel < MOMENTUM_FLIP_THRESH:
+            v_style = "bold red"
 
         if aid in bot.stagnation_start:
             completed = min(stag_t, STAG_LIMIT_SEC)
@@ -504,7 +506,7 @@ def make_logs_panel(bot):
             trade_text.append(f"[{entry['ts']}] {entry['category']}: {entry['msg']}\n", style=entry['style'])
             if entry['details']:
                 trade_text.append(f"{entry['details']}\n", style="dim white")
-            trade_text.append("─"*30 + "\n", style="dim grey")
+            trade_text.append("─" * 30 + "\n", style="dim grey")
 
     # Right: Model Internal Stream
     model_text = Text()
@@ -524,6 +526,7 @@ def make_logs_panel(bot):
     )
 
     return grid
+
 
 def make_layout(bot):
     layout = Layout()

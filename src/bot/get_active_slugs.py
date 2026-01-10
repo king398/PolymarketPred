@@ -33,8 +33,8 @@ log = logging.getLogger("PolyBot")
 ET = pytz.timezone("US/Eastern")
 
 # Symbols for Discovery
-SYMBOLS_SHORT = ["btc", "eth", "xrp", "sol"]
-SYMBOLS_LONG = ["bitcoin", "ethereum", "xrp", "solana"]
+SYMBOLS_SHORT = ["btc", "eth", "xrp", ]
+SYMBOLS_LONG = ["bitcoin", "ethereum", "xrp", ]
 
 # Binance Symbol Mapping
 BINANCE_MAP = {
