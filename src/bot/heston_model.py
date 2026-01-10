@@ -263,7 +263,7 @@ class FastHestonModel:
 
         adj_params = FastHestonModel._adjust_params_for_expiry(T, initial_T, params)
         K_norm = K / S
-        limit = 2000.0 # Matching your binary limit
+        limit = 500 # Matching your binary limit
 
         try:
             P2 = FastHestonModel._integrate_vectorized(K_norm, T, adj_params, 2, limit)
