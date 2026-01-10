@@ -58,7 +58,7 @@ TRADES_LOG_FILE = os.path.join(DATA_DIR, "sim_trade_history.csv")
 # --- Z-SCORE STRATEGY PARAMS ---
 ENTRY_Z_SCORE = -1.5   # Buy YES when Market is 1.5 sigma BELOW Model
 EXIT_Z_SCORE = 0.25    # Exit when Market returns near Model price
-ROLLING_WINDOW = 300   # Ticks to calculate volatility of the residual
+ROLLING_WINDOW = 600   # Ticks to calculate volatility of the residual
 MIN_HISTORY = 30       # Warmup ticks before trading
 MAX_SPREAD = 0.08      # Max Bid/Ask spread allowed
 MAX_POS_SIZE = 100.0   # Max capital per trade
