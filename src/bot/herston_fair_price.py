@@ -1,6 +1,6 @@
 """
 STRATEGY: DELTA-FLUX MOMENTUM SCALPER (PURE VELOCITY)
-OPTIMIZATION: DECOUPLED PULSE ARCHITECTURE (FIXES LATENCY & STAGNATION)
+OPTIMIZATION: DECOUPLED PULSE + THREADED MATH + FEES
 """
 import asyncio
 import aiohttp
@@ -14,6 +14,7 @@ import csv
 import time
 from datetime import datetime
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor # <--- MULTI-THREADING
 
 # --- RICH IMPORTS ---
 from rich.live import Live
@@ -41,6 +42,7 @@ BINANCE_WS = "wss://stream.binance.com:9443/stream?streams=btcusdt@trade/ethusdt
 MIN_VELOCITY_BUY = 0.05       # How fast price must be moving up to buy
 MAX_SPREAD = 0.08             # Max difference between Bid/Ask to allow entry
 MAX_POS_SIZE = 100.0          # Dollars per trade
+TAKER_FEE_PCT = 0.001         # 0.1% Fee (Standard Taker Fee)
 
 # --- EXIT PARAMETERS ---
 STAG_TOLERANCE = 0.015        # Velocity close to 0 is stagnation
@@ -72,7 +74,6 @@ class DataManager:
 
     def _load_sync(self):
         if not os.path.exists(DATA_DIR): os.makedirs(DATA_DIR, exist_ok=True)
-        # Load Params
         if os.path.exists(PARAMS_FILE):
             with open(PARAMS_FILE, "r") as f:
                 for line in f:
@@ -80,7 +81,6 @@ class DataManager:
                         p = json.loads(line)
                         self.bates_params[p['currency']] = p
                     except: pass
-        # Load Strikes
         if os.path.exists(STRIKES_FILE):
             with open(STRIKES_FILE, "r") as f:
                 for line in f:
@@ -88,7 +88,6 @@ class DataManager:
                         obj = json.loads(line)
                         if "clob_token_id" in obj: self.strikes[obj["clob_token_id"]] = float(obj["strike_price"])
                     except: pass
-        # Load Asset IDs
         if os.path.exists(ASSET_ID_FILE):
             with open(ASSET_ID_FILE, "r") as f:
                 for line in f:
@@ -130,7 +129,7 @@ class Position:
         self.asset_id = asset_id
         self.entry_px = entry_px
         self.qty = qty
-        self.cost = entry_px * qty
+        self.cost = entry_px * qty # Note: Tracks GROSS cost for accurate PnL
         self.ts = time.time()
 
 
@@ -142,9 +141,12 @@ class DeltaBot:
         self.pnl = 0.0
         self.wins = 0
         self.losses = 0
+        self.total_fees = 0.0 # <--- Tracks fees
 
-        # Optimization: Pre-index asset IDs by underlying to avoid O(N) loops
-        # Structure: { "BTC": [aid1, aid2], "ETH": [aid3] }
+        # TRUE MULTI-THREADING: Pool for heavy math
+        self.executor = ThreadPoolExecutor(max_workers=2)
+
+        # Optimization Index
         self.asset_index = {}
 
         # Logs
@@ -152,9 +154,9 @@ class DeltaBot:
         self.model_logs = deque(maxlen=20)
 
         # State
-        self.last_state = {}       # Stores {fair, velocity, ts}
-        self.stagnation_start = {} # Stores {aid: timestamp_ms}
-        self.live_dashboard = {}   # Stores display data
+        self.last_state = {}
+        self.stagnation_start = {}
+        self.live_dashboard = {}
         self._init_csv()
 
     def _init_csv(self):
@@ -163,7 +165,6 @@ class DeltaBot:
                 csv.writer(f).writerow(["timestamp", "action", "symbol", "price", "velocity", "reason", "spot", "pnl"])
 
     def rebuild_index(self):
-        """Helper to map underlying -> list of IDs for O(1) access"""
         temp_index = {}
         for aid, meta in self.dm.clob_map.items():
             u = meta.get('underlying')
@@ -186,21 +187,21 @@ class DeltaBot:
         ts = datetime.now().strftime("%H:%M:%S")
         self.model_logs.append(f"[{ts}] {symbol} | Spot: {spot:.1f} | Vel: {vel:+.4f}")
 
-    # --------------------------------------------------------------------------
-    # FAST PATH: Handling Updates (Model Calculation Only)
-    # --------------------------------------------------------------------------
-    def handle_spot_update(self, underlying, spot_price):
-        """
-        Only updates the MODEL state. Does NOT trigger trade logic directly.
-        This prevents the WebSocket consumer from blocking.
-        """
+    # --- MATH WORKER (Runs in Thread Pool) ---
+    def _run_math_sync(self, spot, strike, T_years, initial_T, params):
+        """Heavy blocking math here"""
+        fair = FastHestonModel.price_binary_call(spot, strike, T_years, initial_T, params)
+        return max(0.01, min(0.99, fair))
+
+    # --- MAIN UPDATE LOOP (Non-Blocking) ---
+    async def handle_spot_update(self, underlying, spot_price):
         self.dm.spot_cache[underlying] = spot_price
 
-        # Use the pre-built index instead of looping all items (Optimization)
         affected_ids = self.asset_index.get(underlying, [])
         if not affected_ids: return
 
         now_ts = time.time()
+        loop = asyncio.get_running_loop()
 
         for aid in affected_ids:
             meta = self.dm.clob_map[aid]
@@ -209,31 +210,31 @@ class DeltaBot:
 
             if not (strike and params): continue
 
-            # Simple expiry check
             rem_ms = meta['end_ts_ms'] - (now_ts * 1000)
             if rem_ms <= 0: continue
             T_years = rem_ms / (1000 * 365 * 24 * 3600.0)
 
-            # --- MODEL CALCULATION ---
-            new_fair = FastHestonModel.price_binary_call(spot_price, strike, T_years, meta['initial_T'], params)
-            new_fair = max(0.01, min(0.99, new_fair))
+            # --- OFFLOAD MATH TO WORKER THREAD ---
+            # This 'await' releases the Event Loop while math happens in background
+            new_fair = await loop.run_in_executor(
+                self.executor,
+                self._run_math_sync,
+                spot_price, strike, T_years, meta['initial_T'], params
+            )
 
             # --- VELOCITY CALCULATION ---
             prev = self.last_state.get(aid)
             velocity = 0.0
             if prev:
                 dt = now_ts - prev['ts']
-                # Filter micro-updates (noise) to save CPU
                 if dt > 0.05:
                     velocity = (new_fair - prev['fair']) / dt
 
-            # Update state for the Strategy Pulse to read
             self.last_state[aid] = {'fair': new_fair, 'ts': now_ts, 'velocity': velocity}
 
-            # Update dashboard data (Non-blocking)
+            # Update dashboard (Non-blocking)
             stag_timer = 0.0
             if aid in self.stagnation_start:
-                # Calculate elapsed time in SECONDS
                 stag_timer = (time.time_ns() // 1_000_000 - self.stagnation_start[aid]) / 1000.0
 
             self.live_dashboard[aid] = {
@@ -249,25 +250,16 @@ class DeltaBot:
             if velocity > MIN_VELOCITY_BUY:
                 self.log_model(underlying, spot_price, new_fair, velocity)
 
-    # --------------------------------------------------------------------------
-    # STRATEGY PULSE (The Heartbeat) - Fixes Stagnation & Latency
-    # --------------------------------------------------------------------------
+    # --- STRATEGY PULSE (Heartbeat) ---
     async def strategy_pulse(self):
-        """
-        Runs independent of websockets. Checks logic every 10ms.
-        This ensures exits trigger even if Spot data stops arriving.
-        """
         while True:
             try:
-                # Snapshot keys to avoid dictionary size change errors during iteration
                 active_aids = list(self.last_state.keys())
-
                 for aid in active_aids:
                     state = self.last_state[aid]
                     meta = self.dm.clob_map.get(aid)
                     if not meta: continue
 
-                    # Pull latest cached spot
                     spot = self.dm.spot_cache.get(meta['underlying'], 0.0)
 
                     if aid in self.positions:
@@ -275,42 +267,46 @@ class DeltaBot:
                     else:
                         self.check_entry(aid, state['fair'], state['velocity'], spot, meta['question'])
 
-                # Pulse frequency: 10ms (100Hz)
-                await asyncio.sleep(0.01)
-
-            except Exception as e:
-                # self.log("SYS", f"Pulse Error: {str(e)}", "", "red")
+                await asyncio.sleep(0.01) # 100Hz Pulse
+            except Exception:
                 await asyncio.sleep(0.1)
 
+    # --- ENTRY WITH FEES ---
     def check_entry(self, aid, fair, velocity, spot, question):
         if velocity < MIN_VELOCITY_BUY: return
 
         ticks = state_ticks.get(aid)
         if ticks is None or len(ticks) == 0: return
 
-        # Latency Check
+        # Latency Guard
         data_ts = float(ticks['ts_ms'][-1])
         now_ms = time.time_ns() // 1_000_000
         latency_ms = now_ms - data_ts
-
-        # Filter "Stale" ticks (if market data is older than 500ms, don't trade)
         if latency_ms > 500: return
 
         ask = float(ticks['ask'][-1])
         bid = float(ticks['bid'][-1])
 
-        # Spread/Max Price Guards
         if ask >= 0.90 or ask <= 0.1 or (ask - bid) > MAX_SPREAD: return
 
-        qty = MAX_POS_SIZE / ask
+        # Calculate Fees & Qty
+        entry_fee = MAX_POS_SIZE * TAKER_FEE_PCT
+        invested_amount = MAX_POS_SIZE - entry_fee
+        qty = invested_amount / ask
+
         self.positions[aid] = Position(aid, ask, qty)
+        self.positions[aid].cost = MAX_POS_SIZE # Record Gross Cost
+
         self.cash -= MAX_POS_SIZE
+        self.total_fees += entry_fee
+
         if aid in self.stagnation_start: del self.stagnation_start[aid]
 
-        details = f"Vel: {velocity:+.3f} | Latency: {latency_ms:.1f}ms"
+        details = f"Vel: {velocity:+.3f} | Lat: {latency_ms:.1f}ms | Fee: ${entry_fee:.2f}"
         self.log("BUY", f"Entered {question}", details, "bold green")
         self._write_csv("BUY", question, ask, velocity, "MOMENTUM_ENTRY", spot, 0)
 
+    # --- EXIT WITH FEES ---
     def check_exit(self, aid, fair, velocity, spot, question):
         ticks = state_ticks.get(aid)
         if ticks is None or len(ticks) == 0: return
@@ -321,20 +317,16 @@ class DeltaBot:
         reason = None
         now = time.time_ns() // 1_000_000
 
-        # 1. CRASH GUARD (Negative Momentum)
         if velocity < MOMENTUM_FLIP_THRESH:
             reason = f"FLIP: {velocity:.3f}"
-
-        # 2. STAGNATION EXIT
         elif abs(velocity) < STAG_TOLERANCE:
             if aid not in self.stagnation_start:
                 self.stagnation_start[aid] = now
             else:
-                elapsed = (now - self.stagnation_start[aid]) / 1000.0 # Convert to seconds
+                elapsed = (now - self.stagnation_start[aid]) / 1000.0
                 if elapsed > STAG_LIMIT_SEC:
                     reason = f"STAG: {elapsed:.1f}s"
         else:
-            # Velocity recovered, reset timer
             if aid in self.stagnation_start: del self.stagnation_start[aid]
 
         if reason:
@@ -344,11 +336,17 @@ class DeltaBot:
         now_ms = time.time_ns() // 1_000_000
         latency_ms = now_ms - data_ts
 
-        proceeds = pos.qty * price
-        pnl = proceeds - pos.cost
+        # Fee Logic
+        gross_proceeds = pos.qty * price
+        exit_fee = gross_proceeds * TAKER_FEE_PCT
+        net_proceeds = gross_proceeds - exit_fee
+
+        pnl = net_proceeds - pos.cost
         roi = (pnl / pos.cost) * 100
-        self.cash += proceeds
+
+        self.cash += net_proceeds
         self.pnl += pnl
+        self.total_fees += exit_fee
 
         if pnl > 0: self.wins += 1
         else: self.losses += 1
@@ -357,7 +355,7 @@ class DeltaBot:
         if aid in self.stagnation_start: del self.stagnation_start[aid]
 
         c = "green" if pnl > 0 else "bold red"
-        details = f"Reason: {reason}\nROI: {roi:+.2f}% | Lat: {latency_ms:.1f}ms"
+        details = f"Reason: {reason}\nROI: {roi:+.2f}% | Fee: ${exit_fee:.2f}"
         self.log("SELL", f"Closed {question}", details, c)
         self._write_csv("SELL", question, price, velocity, reason, spot, pnl)
 
@@ -387,7 +385,8 @@ async def binance_ws_worker(bot):
                                 sym_raw = payload['s'].lower()
                                 underlying = bot.dm.stream_map.get(sym_raw)
                                 if underlying:
-                                    bot.handle_spot_update(underlying, float(payload['p']))
+                                    # This is now async and won't block!
+                                    await bot.handle_spot_update(underlying, float(payload['p']))
                         elif msg.type == aiohttp.WSMsgType.ERROR:
                             break
         except Exception:
@@ -405,10 +404,8 @@ async def poly_zmq_worker(bot):
             arr = np.frombuffer(payload, dtype=tick_dtype)
 
             if len(arr) > 0:
-                # Filter bad ticks (0.01 glitch)
                 latest_bid = arr['bid'][-1]
                 latest_ask = arr['ask'][-1]
-
                 if latest_bid > 0.02 and latest_ask > 0.02:
                     state_ticks[aid.decode()] = arr
         except:
@@ -416,7 +413,7 @@ async def poly_zmq_worker(bot):
 
 
 # ==============================================================================
-# 4. DASHBOARD (Optimized)
+# 4. DASHBOARD (With Fees)
 # ==============================================================================
 def make_header(bot):
     grid = Table.grid(expand=True)
@@ -430,14 +427,14 @@ def make_header(bot):
     exposure = sum([p.qty * p.entry_px for p in bot.positions.values()])
 
     grid.add_row(
-        Panel(f"[bold green]${bot.cash:,.2f}[/]", title="Available Cash", border_style="green"),
-        Panel(f"[bold yellow]${bot.pnl:+,.2f}[/]", title="Realized PnL", border_style="yellow"),
-        Panel(f"[cyan]${exposure:,.2f}[/]", title="Active Exposure", border_style="cyan"),
+        Panel(f"[bold green]${bot.cash:,.2f}[/]", title="Cash", border_style="green"),
+        Panel(f"[bold yellow]${bot.pnl:+,.2f}[/]", title="Net PnL", border_style="yellow"),
+        Panel(f"[red]${bot.total_fees:,.2f}[/]", title="Fees Paid", border_style="red"),
         Panel(f"[magenta]{win_rate:.0f}% ({bot.wins}W/{bot.losses}L)[/]", title="Win Rate", border_style="magenta")
     )
     return grid
 
-
+# [Rest of dashboard helpers are same, included for completeness]
 def make_spot_ticker(bot):
     s = bot.dm.spot_cache
     text = Text()
@@ -448,7 +445,6 @@ def make_spot_ticker(bot):
         text.append(f" ${price:,.2f} ", style="bold white on black")
         text.append(" │ ", style="dim grey")
     return Align.center(text)
-
 
 def make_market_table(bot):
     table = Table(box=box.SIMPLE, expand=True, header_style="bold white", row_styles=["dim", ""])
@@ -513,7 +509,6 @@ def make_market_table(bot):
         )
     return table
 
-
 def make_logs_panel(bot):
     trade_text = Text()
     if not bot.logs:
@@ -524,14 +519,12 @@ def make_logs_panel(bot):
             if entry['details']:
                 trade_text.append(f"{entry['details']}\n", style="dim white")
             trade_text.append("─" * 30 + "\n", style="dim grey")
-
     model_text = Text()
     if not bot.model_logs:
         model_text.append("Model waiting for high velocity...", style="dim")
     else:
         for line in reversed(list(bot.model_logs)):
             model_text.append(line + "\n", style="cyan")
-
     grid = Table.grid(expand=True)
     grid.add_column(ratio=1)
     grid.add_column(ratio=1)
@@ -541,13 +534,12 @@ def make_logs_panel(bot):
     )
     return grid
 
-
 def make_layout(bot):
     layout = Layout()
     layout.split_column(
         Layout(make_header(bot), size=3),
         Layout(make_spot_ticker(bot), size=1),
-        Layout(Panel(make_market_table(bot), title="Delta-Flux Scanner (Pulse Optimized)"), ratio=2),
+        Layout(Panel(make_market_table(bot), title="Delta-Flux Scanner (Pulse + Threaded + Fees)"), ratio=2),
         Layout(make_logs_panel(bot), ratio=1)
     )
     return layout
@@ -561,14 +553,12 @@ async def main():
     bot = DeltaBot(dm)
 
     print("Loading Metadata...")
-    # Initial Load
     await asyncio.get_event_loop().run_in_executor(None, dm._load_sync)
-    bot.rebuild_index() # Build Optimization Index
+    bot.rebuild_index()
 
     # Background Tasks
     asyncio.create_task(dm.watch_metadata())
 
-    # Run the index re-builder periodically
     async def index_maintainer():
         while True:
             await asyncio.sleep(30)
@@ -578,7 +568,7 @@ async def main():
     asyncio.create_task(poly_zmq_worker(bot))
     asyncio.create_task(binance_ws_worker(bot))
 
-    # START THE HEARTBEAT (Crucial Fix)
+    # PULSE TASK
     asyncio.create_task(bot.strategy_pulse())
 
     print("Starting Interface...")
