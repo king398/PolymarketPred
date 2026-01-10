@@ -32,7 +32,7 @@ state_lock = asyncio.Lock()
 valid_clobs = set()
 
 # ZMQ Setup
-ZMQ_PUB = "tcp://127.0.0.1:5567"
+ZMQ_PUB = "tcp://127.0.0.1:5569"
 ctx = zmq.Context.instance()
 pub = ctx.socket(zmq.PUB)
 pub.bind(ZMQ_PUB)

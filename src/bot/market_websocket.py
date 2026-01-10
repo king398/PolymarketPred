@@ -6,6 +6,10 @@ from typing import Any, Dict, List, Set
 import orjson
 import json
 import os
+import zmq
+import zmq.asyncio
+import struct
+
 # Try to use uvloop for performance
 try:
     import uvloop
@@ -17,12 +21,13 @@ json_lib = orjson
 
 # --- CONFIG ---
 POLY_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-BINANCE_WS_URL = "wss://fstream.binance.com/ws"  # USDS-M Futures
 DATA_DIR = os.path.join(os.getcwd(), "data")
 ASSET_ID_FILE = os.path.join(DATA_DIR, "clob_token_ids.jsonl")
 
-BIND_HOST = "127.0.0.1"
-BIND_PORT = 9000
+# ZMQ CONFIG
+ZMQ_PORT = 5567
+ZMQ_ADDR = f"tcp://127.0.0.1:{ZMQ_PORT}"
+
 FILE_CHECK_INTERVAL = 60
 
 # --- UTILS ---
@@ -56,85 +61,32 @@ def load_asset_ids():
         print(f"[System] Warning: {ASSET_ID_FILE} not found.")
         return []
 
-# --- BROADCASTER & SERVER ---
-class Broadcaster:
-    def __init__(self) -> None:
-        self.clients: Set[asyncio.StreamWriter] = set()
+# --- ZMQ PUBLISHER ---
+class ZmqPublisher:
+    def __init__(self):
+        self.ctx = zmq.asyncio.Context()
+        self.pub = self.ctx.socket(zmq.PUB)
+        # We bind to the port so the Strategy can Connect to it
+        self.pub.bind(ZMQ_ADDR)
+        print(f"[ZMQ] Publishing Binary Data on {ZMQ_ADDR}")
 
-    def add(self, writer: asyncio.StreamWriter):
-        self.clients.add(writer)
-
-    def remove(self, writer: asyncio.StreamWriter):
-        self.clients.discard(writer)
+    async def publish(self, asset_id: str, ts_ms: int, bid: float, ask: float):
+        """
+        Packs data into binary format for numpy compatibility.
+        Format: <qff (Little-endian, int64, float32, float32)
+        Matches: np.dtype([("ts_ms", np.int64), ("bid", np.float32), ("ask", np.float32)])
+        """
         try:
-            writer.close()
-        except Exception:
-            pass
-
-    def broadcast_line(self, line: bytes):
-        if not self.clients: return
-        dead = []
-        for w in self.clients:
-            try:
-                w.write(line)
-            except Exception:
-                dead.append(w)
-        for w in dead: self.remove(w)
-
-async def tcp_server(b: Broadcaster) -> None:
-    async def handle_client(reader, writer):
-        b.add(writer)
-        try:
-            await reader.read()
-        except Exception:
-            pass
-        finally:
-            b.remove(writer)
-
-    server = await asyncio.start_server(handle_client, BIND_HOST, BIND_PORT)
-    print(f"[TCP] Broadcasting on {BIND_HOST}:{BIND_PORT}")
-    async with server:
-        await server.serve_forever()
-
-# --- BINANCE STREAMER (BTC/ETH) ---
-async def stream_binance(b: Broadcaster) -> None:
-    """Streams BTC and ETH Book Tickers from Binance Spot."""
-    # Spot combined stream URL format: /stream?streams=btcusdt@bookTicker/ethusdt@bookTicker
-    spot_url = "wss://stream.binance.com:9443/stream?streams=btcusdt@bookTicker/ethusdt@bookTicker/solusdt@bookTicker/xrpusdt@bookTicker"
-
-    while True:
-        try:
-            async with websockets.connect(spot_url, ping_interval=20) as ws:
-                print("[Binance Spot] Subscribed to BTC/ETH.")
-
-                async for msg in ws:
-                    try:
-                        raw_data = json_lib.loads(msg)
-                        # Combined streams wrap data in a "data" key
-                        data = raw_data.get("data")
-
-                        symbol = data["s"] # e.g., "BTCUSDT"
-                        asset_id = symbol.replace("USDT", "")
-
-                        out = {
-                            "ts_ms": int(time.time() * 1000), # Spot ticker doesn't always have 'T'
-                            "asset_id": asset_id,
-                            "bid": float(data["b"]),
-                            "ask": float(data["a"])
-                        }
-
-                        line = json_lib.dumps(out) + b"\n"
-                        b.broadcast_line(line)
-
-                    except Exception as e:
-                        continue
-
+            # Struct pack: timestamp (8 bytes), bid (4 bytes), ask (4 bytes)
+            payload = struct.pack('<qff', ts_ms, bid, ask)
+            # Topic is the asset_id
+            await self.pub.send_multipart([asset_id.encode(), payload])
         except Exception as e:
-            print(f"[Binance Spot] Error: {e}. Reconnecting...")
-            await asyncio.sleep(2)
+            print(f"[ZMQ Error] {e}")
+
 # --- POLYMARKET STREAMER ---
-async def stream_polymarket(b: Broadcaster, asset_ids: List[str]) -> None:
-    """Streams data for specific IDs. Raises CancelledError if task is cancelled."""
+async def stream_polymarket(pub: ZmqPublisher, asset_ids: List[str]) -> None:
+    """Streams data for specific IDs and publishes to ZMQ."""
     if not asset_ids:
         print("[Poly] No assets to stream.")
         return
@@ -171,7 +123,6 @@ async def stream_polymarket(b: Broadcaster, asset_ids: List[str]) -> None:
                                 asks = data.get("asks") or []
                                 bb = float(bids[0]["price"]) if bids else None
                                 ba = float(asks[0]["price"]) if asks else None
-
                                 updates.append((aid, bb, ba))
 
                         for aid, new_bid, new_ask in updates:
@@ -183,15 +134,10 @@ async def stream_polymarket(b: Broadcaster, asset_ids: List[str]) -> None:
                                 continue
 
                             market_state[aid] = (curr_bid, curr_ask)
-                            out = {
-                                "ts_ms": ts_ms,
-                                "asset_id": aid,
-                                "bid": curr_bid,
-                                "ask": curr_ask
-                            }
 
-                            line = (json_lib.dumps(out)) + b"\n"
-                            b.broadcast_line(line)
+                            # Publish to ZMQ if we have valid prices
+                            if curr_bid is not None and curr_ask is not None:
+                                await pub.publish(aid, int(ts_ms), curr_bid, curr_ask)
 
         except asyncio.CancelledError:
             print("[Poly] Stream cancelled (reloading IDs).")
@@ -202,18 +148,14 @@ async def stream_polymarket(b: Broadcaster, asset_ids: List[str]) -> None:
 
 # --- MAIN MANAGER ---
 async def main():
-    b = Broadcaster()
+    # 1. Initialize ZMQ Publisher
+    pub = ZmqPublisher()
 
-    # 1. Start TCP Server
-    asyncio.create_task(tcp_server(b))
-
-    # 2. Start Binance Stream (Permanent Background Task)
-    asyncio.create_task(stream_binance(b))
 
     current_ids = []
     poly_task = None
 
-    # 3. Manage Polymarket Stream (Dynamic Reloading)
+    # 2. Manage Polymarket Stream (Dynamic Reloading)
     while True:
         # Check file for new IDs
         new_ids = await asyncio.to_thread(load_asset_ids)
@@ -234,10 +176,13 @@ async def main():
                     pass
 
             current_ids = new_ids
-            poly_task = asyncio.create_task(stream_polymarket(b, current_ids))
+            poly_task = asyncio.create_task(stream_polymarket(pub, current_ids))
 
         # Sleep before checking file again
         await asyncio.sleep(FILE_CHECK_INTERVAL)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Shutting down...")
