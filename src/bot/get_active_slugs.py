@@ -123,6 +123,13 @@ def generate_buckets(interval, count) -> List[Tuple[str, datetime]]:
             start = now.replace(hour=12, minute=0, second=0, microsecond=0)
         delta = timedelta(days=1)
         fmt_func = lambda dt: f"{dt.strftime('%B').lower()}-{dt.day}"
+    elif interval == "15m":
+        # Round down to nearest 15m
+        minute = (now.minute // 15) * 15
+        start = now.replace(minute=minute, second=0, microsecond=0)
+        delta = timedelta(minutes=15)
+        # 15m markets typically use a Unix timestamp in the slug
+        fmt_func = lambda dt: int(dt.timestamp())
     else:
         return []
 
@@ -210,7 +217,7 @@ async def process_standard_markets(session, category, symbols, interval, count, 
     duration_map = {
         "1h": timedelta(hours=1),
         "4h": timedelta(hours=4),
-        "1d": timedelta(days=1)
+        "1d": timedelta(days=1), "15m": timedelta(minutes=15),
     }
 
     for symbol in symbols:
@@ -357,15 +364,15 @@ async def discovery_loop(queue: asyncio.Queue, seen_ids: set):
                 new_batch.extend(await process_standard_markets(
                     session, "1h", SYMBOLS_LONG, "1h", 2, "{symbol}-up-or-down-{param}-et"
                 ))
+                #new_batch.extend(await process_standard_markets(
+                #    session, "4h", SYMBOLS_SHORT, "4h", 1, "{symbol}-updown-4h-{param}"
+                #))
                 new_batch.extend(await process_standard_markets(
-                    session, "4h", SYMBOLS_SHORT, "4h", 1, "{symbol}-updown-4h-{param}"
+                    session, "15m", SYMBOLS_SHORT, "15m", 2, "{symbol}-updown-15m-{param}"
                 ))
-                new_batch.extend(await process_standard_markets(
-                    session, "15m", SYMBOLS_SHORT, "4h", 1, "{symbol}-updown-15m-{param}"
-                ))
-                new_batch.extend(await process_standard_markets(
-                    session, "1d", SYMBOLS_LONG, "1d", 2, "{symbol}-up-or-down-on-{param}"
-                ))
+                #new_batch.extend(await process_standard_markets(
+                #    session, "1d", SYMBOLS_LONG, "1d", 2, "{symbol}-up-or-down-on-{param}"
+                #))
 
                 # 2. Weekly Markets
                 # new_batch.extend(await process_weekly_markets(session, 9))

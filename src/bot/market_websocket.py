@@ -208,7 +208,7 @@ async def main():
     asyncio.create_task(tcp_server(b))
 
     # 2. Start Binance Stream (Permanent Background Task)
-    #asyncio.create_task(stream_binance(b))
+    asyncio.create_task(stream_binance(b))
 
     current_ids = []
     poly_task = None
