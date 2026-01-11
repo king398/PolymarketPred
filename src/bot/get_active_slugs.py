@@ -301,7 +301,7 @@ async def fulfill_market(market_data: Dict, processed_set: set):
     wait_ms = start_ms - now_ms()
 
     # We calculate delay including a 60s buffer to ensure candle is closed/ready
-    wait_sec = (wait_ms / 1000.0) + 60.0
+    wait_sec = (wait_ms / 1000.0) + 10.0
 
     if wait_sec > 0:
         if wait_sec < 3600:

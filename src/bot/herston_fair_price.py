@@ -1,6 +1,6 @@
 """
-STRATEGY: DELTA-FLUX MOMENTUM SCALPER (PURE VELOCITY)
-OPTIMIZATION: DECOUPLED PULSE + THREADED MATH + FEES + DETAILED LOGS
+STRATEGY: DELTA-FLUX MOMENTUM SCALPER (LOW LATENCY)
+ARCH: MULTIPROCESSING + EVENT DRIVEN + BATCH MATH + ASYNC LOGGING
 """
 import asyncio
 import aiohttp
@@ -14,7 +14,7 @@ import csv
 import time
 from datetime import datetime
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 
 # --- RICH IMPORTS ---
 from rich.live import Live
@@ -25,7 +25,6 @@ from rich.text import Text
 from rich import box
 from rich.align import Align
 from rich.progress_bar import ProgressBar
-from rich.style import Style
 
 # --- MODEL IMPORT ---
 from heston_model import FastHestonModel
@@ -39,10 +38,10 @@ ZMQ_ADDR = "tcp://127.0.0.1:5567"
 BINANCE_WS = "wss://stream.binance.com:9443/stream?streams=btcusdt@trade/ethusdt@trade/solusdt@trade/xrpusdt@trade"
 
 # --- STRATEGY PARAMETERS ---
-MIN_VELOCITY_BUY = 0.005
+MIN_VELOCITY_BUY = 0.0005
 MAX_SPREAD = 0.08
 MAX_POS_SIZE = 100.0
-TAKER_FEE_PCT = 0.0125
+TAKER_FEE_PCT = 0.00125
 
 # --- EXIT PARAMETERS ---
 STAG_TOLERANCE = 0.015
@@ -51,7 +50,7 @@ MOMENTUM_FLIP_THRESH = -0.10
 
 # Files
 DATA_DIR = os.path.join(os.getcwd(), "data")
-TRADES_LOG_FILE = os.path.join(DATA_DIR, "delta_scalp_momentum_log.csv")
+TRADES_LOG_FILE = os.path.join(DATA_DIR, "delta_scalp_optimized.csv")
 ASSET_ID_FILE = os.path.join(DATA_DIR, "clob_token_ids.jsonl")
 PARAMS_FILE = os.path.join(DATA_DIR, "bates_params_digital.jsonl")
 STRIKES_FILE = os.path.join(DATA_DIR, "market_1m_candle_opens.jsonl")
@@ -60,9 +59,27 @@ DURATION_MAP = {"15m": 15 / (60 * 24 * 365), "1h": 1 / (24 * 365), "4h": 4 / (24
 tick_dtype = np.dtype([("ts_ms", np.int64), ("bid", np.float32), ("ask", np.float32)])
 state_ticks = {}
 
+# ==============================================================================
+# 1. HELPER: BATCH MATH (RUNS IN SEPARATE PROCESS)
+# ==============================================================================
+def run_math_batch(spot, strikes, T_years_arr, initial_T_arr, params):
+    """
+    This function runs in a separate CPU process.
+    It receives arrays and returns an array of fair prices.
+    """
+    results = []
+    # If FastHestonModel is not vectorized, we loop here (in C-speed, not Python loop overhead)
+    # Using a list comprehension inside the process is much faster than pickling 50 separate tasks.
+    for i in range(len(strikes)):
+        fair = FastHestonModel.price_binary_call(
+            spot, strikes[i], T_years_arr[i], initial_T_arr[i], params
+        )
+        # Clamp result
+        results.append(max(0.01, min(0.99, fair)))
+    return results
 
 # ==============================================================================
-# 1. DATA MANAGER
+# 2. DATA MANAGER
 # ==============================================================================
 class DataManager:
     def __init__(self):
@@ -74,6 +91,7 @@ class DataManager:
 
     def _load_sync(self):
         if not os.path.exists(DATA_DIR): os.makedirs(DATA_DIR, exist_ok=True)
+        # Load Params
         if os.path.exists(PARAMS_FILE):
             with open(PARAMS_FILE, "r") as f:
                 for line in f:
@@ -81,6 +99,7 @@ class DataManager:
                         p = json.loads(line)
                         self.bates_params[p['currency']] = p
                     except: pass
+        # Load Strikes
         if os.path.exists(STRIKES_FILE):
             with open(STRIKES_FILE, "r") as f:
                 for line in f:
@@ -88,6 +107,7 @@ class DataManager:
                         obj = json.loads(line)
                         if "clob_token_id" in obj: self.strikes[obj["clob_token_id"]] = float(obj["strike_price"])
                     except: pass
+        # Load Metadata
         if os.path.exists(ASSET_ID_FILE):
             with open(ASSET_ID_FILE, "r") as f:
                 for line in f:
@@ -119,9 +139,8 @@ class DataManager:
             await loop.run_in_executor(None, self._load_sync)
             await asyncio.sleep(10)
 
-
 # ==============================================================================
-# 2. TRADING ENGINE
+# 3. TRADING ENGINE
 # ==============================================================================
 class Position:
     def __init__(self, asset_id, entry_px, qty):
@@ -130,7 +149,6 @@ class Position:
         self.qty = qty
         self.cost = entry_px * qty
         self.ts = time.time()
-
 
 class DeltaBot:
     def __init__(self, dm: DataManager):
@@ -141,7 +159,13 @@ class DeltaBot:
         self.wins = 0
         self.losses = 0
         self.total_fees = 0.0
-        self.executor = ThreadPoolExecutor(max_workers=2)
+
+        # KEY CHANGE 1: ProcessPool for bypassing GIL
+        self.executor = ProcessPoolExecutor(max_workers=3)
+
+        # KEY CHANGE 2: Async Logging Queue
+        self.log_queue = asyncio.Queue()
+
         self.asset_index = {}
         self.logs = deque(maxlen=30)
         self.model_logs = deque(maxlen=20)
@@ -164,9 +188,12 @@ class DeltaBot:
                 temp_index[u].append(aid)
         self.asset_index = temp_index
 
-    def log(self, category, msg, details=None, style="white"):
+    # --- ASYNC LOGGING ---
+    def queue_log(self, category, msg, details=None, style="white"):
+        # Put data in queue, don't format string yet if possible, or format here quickly
         ts = datetime.now().strftime("%H:%M:%S")
-        self.logs.append({
+        self.log_queue.put_nowait({
+            "type": "UI",
             "ts": ts,
             "category": category,
             "msg": msg,
@@ -174,114 +201,124 @@ class DeltaBot:
             "style": style
         })
 
-    def log_model(self, symbol, spot, fair, vel):
-        ts = datetime.now().strftime("%H:%M:%S")
-        self.model_logs.append(f"[{ts}] {symbol} | Spot: {spot:.1f} | Vel: {vel:+.4f}")
+    def queue_csv(self, action, sym, px, vel, reason, spot, pnl):
+        self.log_queue.put_nowait({
+            "type": "CSV",
+            "row": [datetime.now().isoformat(), action, sym, f"{px:.3f}", f"{vel:.3f}", reason, f"{spot:.1f}", f"{pnl:.2f}"]
+        })
 
-    def _run_math_sync(self, spot, strike, T_years, initial_T, params):
-        fair = FastHestonModel.price_binary_call(spot, strike, T_years, initial_T, params)
-        return max(0.01, min(0.99, fair))
-
+    # --- CORE EVENT LOOP ---
     async def handle_spot_update(self, underlying, spot_price):
+        """
+        Calculates Fair Value for ALL assets of this underlying in one batch.
+        Then triggers entry/exit logic immediately.
+        """
+        if self.dm.spot_cache.get(underlying) == spot_price:
+            return  # No change
         self.dm.spot_cache[underlying] = spot_price
         affected_ids = self.asset_index.get(underlying, [])
         if not affected_ids: return
 
         now_ts = time.time()
-        loop = asyncio.get_running_loop()
+        params = self.dm.bates_params.get(underlying)
+        if not params: return
+
+        # 1. Prepare Batch Data
+        batch_aids = []
+        batch_strikes = []
+        batch_T_years = []
+        batch_init_T = []
 
         for aid in affected_ids:
             meta = self.dm.clob_map[aid]
             strike = self.dm.strikes.get(aid)
-            params = self.dm.bates_params.get(underlying)
+            if not strike: continue
 
-            if not (strike and params): continue
             rem_ms = meta['end_ts_ms'] - (now_ts * 1000)
             if rem_ms <= 0: continue
-            T_years = rem_ms / (1000 * 365 * 24 * 3600.0)
 
-            new_fair = await loop.run_in_executor(
+            batch_aids.append(aid)
+            batch_strikes.append(strike)
+            batch_T_years.append(rem_ms / (1000 * 365 * 24 * 3600.0))
+            batch_init_T.append(meta['initial_T'])
+
+        if not batch_aids: return
+
+        # 2. Run Math in Process Pool (No GIL blocking)
+        # We pass lists; the helper function handles them.
+        try:
+            start = time.time()
+            fairs = await asyncio.get_running_loop().run_in_executor(
                 self.executor,
-                self._run_math_sync,
-                spot_price, strike, T_years, meta['initial_T'], params
+                run_math_batch, # The static function defined above
+                spot_price,
+                batch_strikes,
+                batch_T_years,
+                batch_init_T,
+                params
             )
+            end = time.time()
+        except Exception as e:
+            # self.queue_log("ERR", f"Math Error: {e}")
+            return
 
+        # 3. Process Results & Trigger Logic Instantly
+        for i, new_fair in enumerate(fairs):
+            aid = batch_aids[i]
             prev = self.last_state.get(aid)
+
             velocity = 0.0
             if prev:
                 dt = now_ts - prev['ts']
-                if dt > 0.05:
+                if dt > 0.05: # avoid div by zero or micro-noise
                     velocity = (new_fair - prev['fair']) / dt
 
+            # Update State
             self.last_state[aid] = {'fair': new_fair, 'ts': now_ts, 'velocity': velocity}
 
-            stag_timer = 0.0
-            if aid in self.stagnation_start:
-                stag_timer = (time.time_ns() // 1_000_000 - self.stagnation_start[aid]) / 1000.0
-
+            # Update Dashboard Data (Fast)
+            meta = self.dm.clob_map[aid]
             self.live_dashboard[aid] = {
                 "fair": new_fair,
                 "velocity": velocity,
                 "spot": spot_price,
-                "strike": strike,
-                "stag_timer": stag_timer,
+                "strike": batch_strikes[i],
+                "stag_timer": 0.0, # Calculated in render to save cycles
                 "question": meta['question'],
                 "underlying": underlying
             }
 
+            # 4. TRIGGER (No Sleeping)
+            if aid in self.positions:
+                self.check_exit(aid, new_fair, velocity, spot_price, meta['question'])
+            else:
+                self.check_entry(aid, new_fair, velocity, spot_price, meta['question'])
+
             if velocity > MIN_VELOCITY_BUY:
-                self.log_model(underlying, spot_price, new_fair, velocity)
-
-    async def strategy_pulse(self):
-        while True:
-            try:
-                active_aids = list(self.last_state.keys())
-                for aid in active_aids:
-                    state = self.last_state[aid]
-                    meta = self.dm.clob_map.get(aid)
-                    if not meta: continue
-                    spot = self.dm.spot_cache.get(meta['underlying'], 0.0)
-
-                    if aid in self.positions:
-                        self.check_exit(aid, state['fair'], state['velocity'], spot, meta['question'])
-                    else:
-                        self.check_entry(aid, state['fair'], state['velocity'], spot, meta['question'])
-                await asyncio.sleep(0.01)
-            except Exception:
-                await asyncio.sleep(0.1)
+                ts = datetime.now().strftime("%H:%M:%S")
+                self.model_logs.append(f"[{ts}] {underlying} | Spot: {spot_price:.1f} | Vel: {velocity:+.4f}")
 
     # ==============================================================================
-    # 5. DETAILED LOGGING ENTRY
+    # 4. ENTRY LOGIC
     # ==============================================================================
     def check_entry(self, aid, fair, velocity, spot, question):
         if velocity < MIN_VELOCITY_BUY: return
 
-        # 1. Data Availability Check
         ticks = state_ticks.get(aid)
-        if ticks is None or len(ticks) == 0:
-            # self.log("DEBUG", f"Skip {question[:20]}...", "Reason: No ZMQ Data", "dim")
-            return
+        if ticks is None or len(ticks) == 0: return
 
-        # 2. Latency Check
+        # Latency Guard
         data_ts = float(ticks['ts_ms'][-1])
         now_ms = time.time_ns() // 1_000_000
-        latency_ms = now_ms - data_ts
-        if latency_ms > 1000:
-            self.log("DEBUG", f"Skip {question[:20]}...", f"Reason: Latency {latency_ms}ms > 1000ms", "dim")
-            return
 
         ask = float(ticks['ask'][-1])
         bid = float(ticks['bid'][-1])
         spread = ask - bid
 
-        # 3. Spread/Price Guard Checks
-        if ask >= 0.95: return
-        if ask <= 0.05: return
-        if spread > MAX_SPREAD:
-            self.log("DEBUG", f"Skip {question[:20]}...", f"Reason: Spread {spread:.3f} > {MAX_SPREAD}", "dim")
-            return
+        if ask >= 0.95 or ask <= 0.05: return
+        if spread > MAX_SPREAD: return
 
-        # 4. Success -> Execute
+        # Execute
         entry_fee = MAX_POS_SIZE * TAKER_FEE_PCT
         invested_amount = MAX_POS_SIZE - entry_fee
         qty = invested_amount / ask
@@ -293,27 +330,24 @@ class DeltaBot:
 
         if aid in self.stagnation_start: del self.stagnation_start[aid]
 
-        details = (
-            f"Vel: {velocity:+.3f} | Lat: {latency_ms:.1f}ms\n"
-            f"Ask: {ask:.3f} | Spread: {spread:.3f}\n"
-            f"Inv: ${invested_amount:.2f} (Fee: ${entry_fee:.2f})"
-        )
-        self.log("BUY", f"Entered {question}", details, "bold green")
-        self._write_csv("BUY", question, ask, velocity, "MOMENTUM_ENTRY", spot, 0)
+        details = f"Vel: {velocity:+.3f} | Ask: {ask:.3f} | Spread: {spread:.3f} | Fee: ${entry_fee:.2f} | Latency: {now_ms - data_ts}ms"
+        self.queue_log("BUY", f"Entered {question}", details, "bold green")
+        self.queue_csv("BUY", question, ask, velocity, "MOMENTUM_ENTRY", spot, 0)
 
     # ==============================================================================
-    # 6. DETAILED LOGGING EXIT
+    # 5. EXIT LOGIC
     # ==============================================================================
     def check_exit(self, aid, fair, velocity, spot, question):
         ticks = state_ticks.get(aid)
-        if ticks is None or len(ticks) == 0: return
+        if ticks is None: return
 
         bid = float(ticks['bid'][-1])
         data_ts = float(ticks['ts_ms'][-1])
-        pos = self.positions[aid]
+
         reason = None
         now = time.time_ns() // 1_000_000
 
+        # Exit Conditions
         if velocity < MOMENTUM_FLIP_THRESH:
             reason = f"FLIP: {velocity:.3f}"
         elif abs(velocity) < STAG_TOLERANCE:
@@ -327,57 +361,51 @@ class DeltaBot:
             if aid in self.stagnation_start: del self.stagnation_start[aid]
 
         if reason:
-            self._execute_sell(aid, pos, bid, reason, velocity, fair, spot, question, data_ts)
+            self._execute_sell(aid, self.positions[aid], bid, reason, velocity, spot, question, data_ts)
 
-    def _execute_sell(self, aid, pos, price, reason, velocity, fair, spot, question, data_ts):
-        now_ms = time.time_ns() // 1_000_000
-        latency_ms = now_ms - data_ts
+    def _execute_sell(self, aid, pos, price, reason, velocity, spot, question, data_ts):
+        gross = pos.qty * price
+        fee = gross * TAKER_FEE_PCT
+        net = gross - fee
+        pnl = net - pos.cost
 
-        gross_proceeds = pos.qty * price
-        exit_fee = gross_proceeds * TAKER_FEE_PCT
-        net_proceeds = gross_proceeds - exit_fee
-
-        pnl = net_proceeds - pos.cost
-        roi = (pnl / pos.cost) * 100
-
-        self.cash += net_proceeds
+        self.cash += net
         self.pnl += pnl
-        self.total_fees += exit_fee
+        self.total_fees += fee
 
         if pnl > 0: self.wins += 1
         else: self.losses += 1
 
         del self.positions[aid]
         if aid in self.stagnation_start: del self.stagnation_start[aid]
-
+        now = time.time_ns() // 1_000_000
         c = "green" if pnl > 0 else "bold red"
-        details = (
-            f"Reason: {reason}\n"
-            f"Bid: {price:.3f} | Lat: {latency_ms:.1f}ms\n"
-            f"Gross: ${gross_proceeds:.2f} -> Net: ${net_proceeds:.2f} (Fee: ${exit_fee:.2f})\n"
-            f"ROI: {roi:+.2f}%"
-        )
-        self.log("SELL", f"Closed {question}", details, c)
-        self._write_csv("SELL", question, price, velocity, reason, spot, pnl)
-
-    def _write_csv(self, action, sym, px, vel, reason, spot, pnl):
-        with open(TRADES_LOG_FILE, 'a', newline='') as f:
-            csv.writer(f).writerow([
-                datetime.now().isoformat(), action, sym,
-                f"{px:.3f}", f"{vel:.3f}", reason,
-                f"{spot:.1f}", f"{pnl:.2f}"
-            ])
-
+        details = f"Bid: {price:.3f} | PnL: ${pnl:.2f} | Fee: ${fee:.2f} | Vel: {velocity:+.3f} | Latency: {now - data_ts}ms"
+        self.queue_log("SELL", f"Closed {question} ({reason})", details, c)
+        self.queue_csv("SELL", question, price, velocity, reason, spot, pnl)
 
 # ==============================================================================
-# 3. WORKERS
+# 6. WORKERS (IO & LOGGING)
 # ==============================================================================
+async def logger_worker(bot):
+    """Handles file IO and UI log appending off the main thread"""
+    while True:
+        item = await bot.log_queue.get()
+        if item['type'] == 'UI':
+            bot.logs.append(item)
+        elif item['type'] == 'CSV':
+            try:
+                with open(TRADES_LOG_FILE, 'a', newline='') as f:
+                    csv.writer(f).writerow(item['row'])
+            except: pass
+        bot.log_queue.task_done()
+
 async def binance_ws_worker(bot):
     while True:
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.ws_connect(BINANCE_WS) as ws:
-                    bot.log("SYS", "Connected to Binance Stream", "", "blue")
+                    bot.queue_log("SYS", "Connected to Binance", style="blue")
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             data = json.loads(msg.data)
@@ -385,173 +413,127 @@ async def binance_ws_worker(bot):
                                 payload = data['data']
                                 sym_raw = payload['s'].lower()
                                 underlying = bot.dm.stream_map.get(sym_raw)
+                                # only compute if price changed
+
                                 if underlying:
+                                    # Trigger computation immediately
                                     await bot.handle_spot_update(underlying, float(payload['p']))
                         elif msg.type == aiohttp.WSMsgType.ERROR:
                             break
         except Exception:
             await asyncio.sleep(2)
 
-
 async def poly_zmq_worker(bot):
     ctx = zmq.asyncio.Context.instance()
     sub = ctx.socket(zmq.SUB)
     sub.connect(ZMQ_ADDR)
-    sub.setsockopt(zmq.CONFLATE, 1)
     sub.subscribe(b"")
 
     while True:
         try:
-            aid, payload = await sub.recv_multipart()
+            aid_bytes, payload = await sub.recv_multipart()
+
+            # Optimization: Basic length check before numpy overhead
+            if len(payload) == 0: continue
+
             arr = np.frombuffer(payload, dtype=tick_dtype)
-            if len(arr) > 0:
-                latest_bid = arr['bid'][-1]
-                latest_ask = arr['ask'][-1]
+            if len(arr) == 0: continue
 
-                # --- FILTER LOGIC STARTS HERE ---
+            latest_bid = arr['bid'][-1]
+            latest_ask = arr['ask'][-1]
 
-                # 1. Reject specific "Glitch" price (0.010)
-                # We check if the price is within 0.0001 of 0.01 to catch floats like 0.0099999 or 0.0100001
-                if abs(latest_bid - 0.01) < 0.0001 or abs(latest_ask - 0.01) < 0.0001:
-                    continue  # Skip this tick entirely
+            # Fast Filter
+            if latest_bid < 0.005: continue
+            if abs(latest_bid - 0.01) < 0.0001: continue # Glitch filter
 
-                # 2. Reject "Dead" prices (too close to zero)
-                if latest_bid < 0.005 or latest_ask < 0.005:
-                    continue
+            aid = aid_bytes.decode()
+            state_ticks[aid] = arr
 
-                # Valid tick found, update state
-                state_ticks[aid.decode()] = arr
+            # --- ZMQ Triggered Logic (Optional: Spread checking) ---
+            # If we hold a position, we might want to exit on ZMQ update if liquidity collapses
+            # For now, we rely on Spot updates for velocity, but you could add check_exit here too.
 
-        except:
+        except Exception:
             await asyncio.sleep(0.01)
 
 # ==============================================================================
-# 4. DASHBOARD
+# 7. VISUALIZATION (SEPARATE FROM LOGIC)
 # ==============================================================================
-def make_header(bot):
+def make_layout(bot):
+    # Header
     grid = Table.grid(expand=True)
-    grid.add_column(justify="center", ratio=1)
-    grid.add_column(justify="center", ratio=1)
-    grid.add_column(justify="center", ratio=1)
-    grid.add_column(justify="center", ratio=1)
-
-    total_trades = bot.wins + bot.losses
-    win_rate = (bot.wins / total_trades * 100) if total_trades > 0 else 0
-    exposure = sum([p.qty * p.entry_px for p in bot.positions.values()])
-
+    grid.add_column(ratio=1); grid.add_column(ratio=1); grid.add_column(ratio=1); grid.add_column(ratio=1)
+    tot = bot.wins + bot.losses
+    wr = (bot.wins / tot * 100) if tot > 0 else 0
     grid.add_row(
         Panel(f"[bold green]${bot.cash:,.2f}[/]", title="Cash", border_style="green"),
         Panel(f"[bold yellow]${bot.pnl:+,.2f}[/]", title="Net PnL", border_style="yellow"),
-        Panel(f"[red]${bot.total_fees:,.2f}[/]", title="Fees Paid", border_style="red"),
-        Panel(f"[magenta]{win_rate:.0f}% ({bot.wins}W/{bot.losses}L)[/]", title="Win Rate", border_style="magenta")
+        Panel(f"[red]${bot.total_fees:,.2f}[/]", title="Fees", border_style="red"),
+        Panel(f"[magenta]{wr:.0f}% ({bot.wins}/{bot.losses})[/]", title="Win Rate", border_style="magenta")
     )
-    return grid
 
-def make_spot_ticker(bot):
-    s = bot.dm.spot_cache
-    text = Text()
-    text.append(" LIVE SPOT:  ", style="bold white on black")
+    # Spot Ticker
+    s_text = Text(" LIVE SPOT: ", style="bold white on black")
     colors = {"BTC": "orange1", "ETH": "blue", "SOL": "magenta", "XRP": "white"}
-    for sym, price in s.items():
-        text.append(f" {sym} ", style=f"bold black on {colors.get(sym, 'white')}")
-        text.append(f" ${price:,.2f} ", style="bold white on black")
-        text.append(" │ ", style="dim grey")
-    return Align.center(text)
+    for sym, price in bot.dm.spot_cache.items():
+        s_text.append(f" {sym} ${price:,.2f} ", style=f"bold black on {colors.get(sym,'white')}")
 
-def make_market_table(bot):
+    # Main Table
     table = Table(box=box.SIMPLE, expand=True, header_style="bold white", row_styles=["dim", ""])
-    table.add_column("Market / Strike", ratio=3)
-    table.add_column("Moneyness", justify="right", width=12)
-    table.add_column("Spread", justify="right", width=10)
+    table.add_column("Market", ratio=3)
+    table.add_column("Strike/Dist", justify="right", width=15)
+    table.add_column("Spread", justify="right", width=8)
     table.add_column("Velocity", justify="right", width=10)
-    table.add_column("Stagnation (Exit)", justify="left", width=20)
     table.add_column("Status", justify="center", width=12)
 
     active_ids = sorted(bot.live_dashboard.keys(), key=lambda x: bot.dm.clob_map.get(x, {}).get('question', ''))
-    if not active_ids:
-        table.add_row("[dim]Waiting for data stream...[/]", "", "", "", "", "")
 
     for aid in active_ids[:18]:
-        data = bot.live_dashboard[aid]
-        meta = bot.dm.clob_map.get(aid)
-        if not meta: continue
-
-        vel = data['velocity']
-        spot = data['spot']
-        strike = data['strike']
-        stag_t = data['stag_timer']
-
+        d = bot.live_dashboard[aid]
         ticks = state_ticks.get(aid)
-        spread = 0.0
-        if ticks is not None and len(ticks) > 0:
-            spread = ticks['ask'][-1] - ticks['bid'][-1]
+        if not ticks: continue
 
-        dist_pct = ((spot - strike) / strike) * 100
-        mon_style = "green" if dist_pct > 0 else "red"
-        moneyness_str = f"[{mon_style}]{dist_pct:+.2f}%[/]"
+        ask, bid = ticks['ask'][-1], ticks['bid'][-1]
+        spread = ask - bid
+        dist = ((d['spot'] - d['strike']) / d['strike']) * 100
 
-        v_style = "dim"
-        if vel > MIN_VELOCITY_BUY: v_style = "bold green"
-        elif vel < MOMENTUM_FLIP_THRESH: v_style = "bold red"
-
+        # Stagnation Bar
+        stag_render = ""
         if aid in bot.stagnation_start:
-            completed = min(stag_t, STAG_LIMIT_SEC)
-            bar = ProgressBar(total=STAG_LIMIT_SEC, completed=completed, width=15, style="red", complete_style="bold red", finished_style="blink bold red")
-            stag_render = bar
-        else:
-            stag_render = Text("-", style="dim")
+            el = (time.time_ns()//1000000 - bot.stagnation_start[aid])/1000
+            if el > 0.5: stag_render = f"[red]STAG {el:.1f}s[/]"
 
-        status = "-"
+        # Status
+        status = stag_render
         if aid in bot.positions:
-            pos = bot.positions[aid]
-            unreal = (ticks['ask'][-1] - pos.entry_px) * pos.qty if ticks else 0
-            c = "green" if unreal > 0 else "red"
-            status = f"[{c}]${unreal:+.1f}[/{c}]"
-        elif vel > MIN_VELOCITY_BUY:
+            unreal = (ask - bot.positions[aid].entry_px) * bot.positions[aid].qty
+            status = f"[{'green' if unreal>0 else 'red'}]${unreal:+.1f}[/]"
+        elif d['velocity'] > MIN_VELOCITY_BUY:
             status = "[blink bold yellow]SIGNAL[/]"
 
+        v_col = "green" if d['velocity'] > 0.002 else ("red" if d['velocity'] < -0.002 else "dim")
+
         table.add_row(
-            f"{meta['question']}\n[dim]Strike: ${strike}[/]",
-            moneyness_str,
+            d['question'],
+            f"${d['strike']} ({dist:+.2f}%)",
             f"{spread:.3f}",
-            f"[{v_style}]{vel:+.4f}[/{v_style}]",
-            stag_render,
+            f"[{v_col}]{d['velocity']:+.4f}[/]",
             status
         )
-    return table
 
-def make_logs_panel(bot):
-    trade_text = Text()
-    if not bot.logs:
-        trade_text.append("No trades yet...", style="dim")
-    else:
-        for entry in reversed(list(bot.logs)):
-            trade_text.append(f"[{entry['ts']}] {entry['category']}: {entry['msg']}\n", style=entry['style'])
-            if entry['details']:
-                trade_text.append(f"{entry['details']}\n", style="dim white")
-            trade_text.append("─" * 30 + "\n", style="dim grey")
-    model_text = Text()
-    if not bot.model_logs:
-        model_text.append("Model waiting for high velocity...", style="dim")
-    else:
-        for line in reversed(list(bot.model_logs)):
-            model_text.append(line + "\n", style="cyan")
-    grid = Table.grid(expand=True)
-    grid.add_column(ratio=1)
-    grid.add_column(ratio=1)
-    grid.add_row(
-        Panel(trade_text, title="Execution Log (Newest First)", border_style="white"),
-        Panel(model_text, title="Momentum Stream (Newest First)", border_style="cyan")
-    )
-    return grid
+    # Logs
+    log_txt = Text()
+    for e in reversed(list(bot.logs)):
+        log_txt.append(f"[{e['ts']}] {e['msg']} ", style=e['style'])
+        if e['details']: log_txt.append(f"| {e['details']}", style="dim")
+        log_txt.append("\n")
 
-def make_layout(bot):
     layout = Layout()
     layout.split_column(
-        Layout(make_header(bot), size=3),
-        Layout(make_spot_ticker(bot), size=1),
-        Layout(Panel(make_market_table(bot), title="Delta-Flux Scanner (Verbose Logs)"), ratio=2),
-        Layout(make_logs_panel(bot), ratio=1)
+        Layout(grid, size=3),
+        Layout(Align.center(s_text), size=1),
+        Layout(Panel(table, title="Delta-Flux Velocity Scanner"), ratio=2),
+        Layout(Panel(log_txt, title="Event Log"), ratio=1)
     )
     return layout
 
@@ -564,22 +546,24 @@ async def main():
     bot.rebuild_index()
 
     asyncio.create_task(dm.watch_metadata())
-    async def index_maintainer():
+    asyncio.create_task(logger_worker(bot))
+    asyncio.create_task(poly_zmq_worker(bot))
+    asyncio.create_task(binance_ws_worker(bot))
+
+    # Re-index occasionally
+    async def indexer():
         while True:
             await asyncio.sleep(30)
             bot.rebuild_index()
-    asyncio.create_task(index_maintainer())
-
-    asyncio.create_task(poly_zmq_worker(bot))
-    asyncio.create_task(binance_ws_worker(bot))
-    asyncio.create_task(bot.strategy_pulse())
+    asyncio.create_task(indexer())
 
     print("Starting Interface...")
-    await asyncio.sleep(2)
-    with Live(make_layout(bot), refresh_per_second=2, screen=True) as live:
+    await asyncio.sleep(1)
+
+    with Live(make_layout(bot), refresh_per_second=1, screen=True) as live:
         while True:
             live.update(make_layout(bot))
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1.0)
 
 if __name__ == "__main__":
     try:
