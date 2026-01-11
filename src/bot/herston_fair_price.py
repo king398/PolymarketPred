@@ -38,7 +38,7 @@ ZMQ_ADDR = "tcp://127.0.0.1:5567"
 BINANCE_WS = "wss://stream.binance.com:9443/stream?streams=btcusdt@trade/ethusdt@trade/solusdt@trade/xrpusdt@trade"
 
 # --- STRATEGY PARAMETERS ---
-MIN_VELOCITY_BUY = 0.0005
+MIN_VELOCITY_BUY = 0.0010
 MAX_SPREAD = 0.08
 MAX_POS_SIZE = 100.0
 TAKER_FEE_PCT = 0.00125
@@ -59,6 +59,7 @@ DURATION_MAP = {"15m": 15 / (60 * 24 * 365), "1h": 1 / (24 * 365), "4h": 4 / (24
 tick_dtype = np.dtype([("ts_ms", np.int64), ("bid", np.float32), ("ask", np.float32)])
 state_ticks = {}
 
+
 # ==============================================================================
 # 1. HELPER: BATCH MATH (RUNS IN SEPARATE PROCESS)
 # ==============================================================================
@@ -77,6 +78,7 @@ def run_math_batch(spot, strikes, T_years_arr, initial_T_arr, params):
         # Clamp result
         results.append(max(0.01, min(0.99, fair)))
     return results
+
 
 # ==============================================================================
 # 2. DATA MANAGER
@@ -98,7 +100,8 @@ class DataManager:
                     try:
                         p = json.loads(line)
                         self.bates_params[p['currency']] = p
-                    except: pass
+                    except:
+                        pass
         # Load Strikes
         if os.path.exists(STRIKES_FILE):
             with open(STRIKES_FILE, "r") as f:
@@ -106,7 +109,8 @@ class DataManager:
                     try:
                         obj = json.loads(line)
                         if "clob_token_id" in obj: self.strikes[obj["clob_token_id"]] = float(obj["strike_price"])
-                    except: pass
+                    except:
+                        pass
         # Load Metadata
         if os.path.exists(ASSET_ID_FILE):
             with open(ASSET_ID_FILE, "r") as f:
@@ -116,10 +120,14 @@ class DataManager:
                         m = json.loads(line)
                         slug = m.get('slug', '').lower()
                         underlying = None
-                        if 'btc' in slug: underlying = "BTC"
-                        elif 'eth' in slug: underlying = "ETH"
-                        elif 'sol' in slug: underlying = "SOL"
-                        elif 'xrp' in slug: underlying = "XRP"
+                        if 'btc' in slug:
+                            underlying = "BTC"
+                        elif 'eth' in slug:
+                            underlying = "ETH"
+                        elif 'sol' in slug:
+                            underlying = "SOL"
+                        elif 'xrp' in slug:
+                            underlying = "XRP"
 
                         if underlying and m.get('clob_token_id'):
                             dt = datetime.fromisoformat(m['market_end'].replace('Z', '+00:00'))
@@ -131,13 +139,15 @@ class DataManager:
                                 "end_ts_ms": int(dt.timestamp() * 1000),
                                 "initial_T": t_dur
                             }
-                    except: pass
+                    except:
+                        pass
 
     async def watch_metadata(self):
         loop = asyncio.get_event_loop()
         while True:
             await loop.run_in_executor(None, self._load_sync)
             await asyncio.sleep(10)
+
 
 # ==============================================================================
 # 3. TRADING ENGINE
@@ -149,6 +159,7 @@ class Position:
         self.qty = qty
         self.cost = entry_px * qty
         self.ts = time.time()
+
 
 class DeltaBot:
     def __init__(self, dm: DataManager):
@@ -204,7 +215,8 @@ class DeltaBot:
     def queue_csv(self, action, sym, px, vel, reason, spot, pnl):
         self.log_queue.put_nowait({
             "type": "CSV",
-            "row": [datetime.now().isoformat(), action, sym, f"{px:.3f}", f"{vel:.3f}", reason, f"{spot:.1f}", f"{pnl:.2f}"]
+            "row": [datetime.now().isoformat(), action, sym, f"{px:.3f}", f"{vel:.3f}", reason, f"{spot:.1f}",
+                    f"{pnl:.2f}"]
         })
 
     # --- CORE EVENT LOOP ---
@@ -250,7 +262,7 @@ class DeltaBot:
             start = time.time()
             fairs = await asyncio.get_running_loop().run_in_executor(
                 self.executor,
-                run_math_batch, # The static function defined above
+                run_math_batch,  # The static function defined above
                 spot_price,
                 batch_strikes,
                 batch_T_years,
@@ -270,7 +282,7 @@ class DeltaBot:
             velocity = 0.0
             if prev:
                 dt = now_ts - prev['ts']
-                if dt > 0.05: # avoid div by zero or micro-noise
+                if dt > 0.05:  # avoid div by zero or micro-noise
                     velocity = (new_fair - prev['fair']) / dt
 
             # Update State
@@ -283,7 +295,7 @@ class DeltaBot:
                 "velocity": velocity,
                 "spot": spot_price,
                 "strike": batch_strikes[i],
-                "stag_timer": 0.0, # Calculated in render to save cycles
+                "stag_timer": 0.0,  # Calculated in render to save cycles
                 "question": meta['question'],
                 "underlying": underlying
             }
@@ -373,8 +385,10 @@ class DeltaBot:
         self.pnl += pnl
         self.total_fees += fee
 
-        if pnl > 0: self.wins += 1
-        else: self.losses += 1
+        if pnl > 0:
+            self.wins += 1
+        else:
+            self.losses += 1
 
         del self.positions[aid]
         if aid in self.stagnation_start: del self.stagnation_start[aid]
@@ -383,6 +397,7 @@ class DeltaBot:
         details = f"Bid: {price:.3f} | PnL: ${pnl:.2f} | Fee: ${fee:.2f} | Vel: {velocity:+.3f} | Latency: {now - data_ts}ms"
         self.queue_log("SELL", f"Closed {question} ({reason})", details, c)
         self.queue_csv("SELL", question, price, velocity, reason, spot, pnl)
+
 
 # ==============================================================================
 # 6. WORKERS (IO & LOGGING)
@@ -397,8 +412,10 @@ async def logger_worker(bot):
             try:
                 with open(TRADES_LOG_FILE, 'a', newline='') as f:
                     csv.writer(f).writerow(item['row'])
-            except: pass
+            except:
+                pass
         bot.log_queue.task_done()
+
 
 async def binance_ws_worker(bot):
     while True:
@@ -423,6 +440,7 @@ async def binance_ws_worker(bot):
         except Exception:
             await asyncio.sleep(2)
 
+
 async def poly_zmq_worker(bot):
     ctx = zmq.asyncio.Context.instance()
     sub = ctx.socket(zmq.SUB)
@@ -444,7 +462,7 @@ async def poly_zmq_worker(bot):
 
             # Fast Filter
             if latest_bid < 0.005: continue
-            if abs(latest_bid - 0.01) < 0.0001: continue # Glitch filter
+            if abs(latest_bid - 0.01) < 0.0001: continue  # Glitch filter
 
             aid = aid_bytes.decode()
             state_ticks[aid] = arr
@@ -456,13 +474,17 @@ async def poly_zmq_worker(bot):
         except Exception:
             await asyncio.sleep(0.01)
 
+
 # ==============================================================================
 # 7. VISUALIZATION (SEPARATE FROM LOGIC)
 # ==============================================================================
 def make_layout(bot):
     # Header
     grid = Table.grid(expand=True)
-    grid.add_column(ratio=1); grid.add_column(ratio=1); grid.add_column(ratio=1); grid.add_column(ratio=1)
+    grid.add_column(ratio=1);
+    grid.add_column(ratio=1);
+    grid.add_column(ratio=1);
+    grid.add_column(ratio=1)
     tot = bot.wins + bot.losses
     wr = (bot.wins / tot * 100) if tot > 0 else 0
     grid.add_row(
@@ -476,7 +498,7 @@ def make_layout(bot):
     s_text = Text(" LIVE SPOT: ", style="bold white on black")
     colors = {"BTC": "orange1", "ETH": "blue", "SOL": "magenta", "XRP": "white"}
     for sym, price in bot.dm.spot_cache.items():
-        s_text.append(f" {sym} ${price:,.2f} ", style=f"bold black on {colors.get(sym,'white')}")
+        s_text.append(f" {sym} ${price:,.2f} ", style=f"bold black on {colors.get(sym, 'white')}")
 
     # Main Table
     table = Table(box=box.SIMPLE, expand=True, header_style="bold white", row_styles=["dim", ""])
@@ -500,14 +522,14 @@ def make_layout(bot):
         # Stagnation Bar
         stag_render = ""
         if aid in bot.stagnation_start:
-            el = (time.time_ns()//1000000 - bot.stagnation_start[aid])/1000
+            el = (time.time_ns() // 1000000 - bot.stagnation_start[aid]) / 1000
             if el > 0.5: stag_render = f"[red]STAG {el:.1f}s[/]"
 
         # Status
         status = stag_render
         if aid in bot.positions:
             unreal = (ask - bot.positions[aid].entry_px) * bot.positions[aid].qty
-            status = f"[{'green' if unreal>0 else 'red'}]${unreal:+.1f}[/]"
+            status = f"[{'green' if unreal > 0 else 'red'}]${unreal:+.1f}[/]"
         elif d['velocity'] > MIN_VELOCITY_BUY:
             status = "[blink bold yellow]SIGNAL[/]"
 
@@ -537,6 +559,7 @@ def make_layout(bot):
     )
     return layout
 
+
 async def main():
     dm = DataManager()
     bot = DeltaBot(dm)
@@ -555,6 +578,7 @@ async def main():
         while True:
             await asyncio.sleep(30)
             bot.rebuild_index()
+
     asyncio.create_task(indexer())
 
     print("Starting Interface...")
@@ -564,6 +588,7 @@ async def main():
         while True:
             live.update(make_layout(bot))
             await asyncio.sleep(1.0)
+
 
 if __name__ == "__main__":
     try:
