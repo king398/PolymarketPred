@@ -346,6 +346,7 @@ class DeltaBot:
         self.queue_log("BUY", f"Entered {question}", details, "bold green")
         self.queue_csv("BUY", question, ask, velocity, "MOMENTUM_ENTRY", spot, 0)
 
+
     # ==============================================================================
     # 5. EXIT LOGIC
     # ==============================================================================
