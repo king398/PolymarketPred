@@ -38,10 +38,10 @@ ZMQ_ADDR = "tcp://127.0.0.1:5567"
 BINANCE_WS = "wss://stream.binance.com:9443/stream?streams=btcusdt@trade/ethusdt@trade/solusdt@trade/xrpusdt@trade"
 
 # --- STRATEGY PARAMETERS ---
-MIN_VELOCITY_BUY = 0.0010
+MIN_VELOCITY_BUY = 0.002
 MAX_SPREAD = 0.08
 MAX_POS_SIZE = 100.0
-TAKER_FEE_PCT = 0.00125
+TAKER_FEE_PCT = 0.0125
 
 # --- EXIT PARAMETERS ---
 STAG_TOLERANCE = 0.015
@@ -327,7 +327,7 @@ class DeltaBot:
         bid = float(ticks['bid'][-1])
         spread = ask - bid
 
-        if ask >= 0.95 or ask <= 0.05: return
+        if ask >= 0.90 or ask <= 0.20: return
         if spread > MAX_SPREAD: return
 
         # Execute
@@ -430,7 +430,6 @@ async def binance_ws_worker(bot):
                                 payload = data['data']
                                 sym_raw = payload['s'].lower()
                                 underlying = bot.dm.stream_map.get(sym_raw)
-                                # only compute if price changed
 
                                 if underlying:
                                     # Trigger computation immediately
