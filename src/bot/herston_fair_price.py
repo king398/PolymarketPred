@@ -38,7 +38,7 @@ ZMQ_ADDR = "tcp://127.0.0.1:5567"
 BINANCE_WS = "wss://stream.binance.com:9443/stream?streams=btcusdt@trade/ethusdt@trade/solusdt@trade/xrpusdt@trade"
 
 # --- STRATEGY PARAMETERS ---
-MIN_VELOCITY_BUY = 0.002
+MIN_VELOCITY_BUY = 0.003
 MAX_SPREAD = 0.08
 MAX_POS_SIZE = 100.0
 TAKER_FEE_PCT = 0.0125
@@ -46,7 +46,7 @@ TAKER_FEE_PCT = 0.0125
 # --- EXIT PARAMETERS ---
 STAG_TOLERANCE = 0.015
 STAG_LIMIT_SEC = 5.0
-MOMENTUM_FLIP_THRESH = -0.10
+MOMENTUM_FLIP_THRESH = -0.01
 
 # Files
 DATA_DIR = os.path.join(os.getcwd(), "data")
@@ -345,7 +345,6 @@ class DeltaBot:
         details = f"Vel: {velocity:+.3f} | Ask: {ask:.3f} | Spread: {spread:.3f} | Fee: ${entry_fee:.2f} | Latency: {now_ms - data_ts}ms"
         self.queue_log("BUY", f"Entered {question}", details, "bold green")
         self.queue_csv("BUY", question, ask, velocity, "MOMENTUM_ENTRY", spot, 0)
-
 
     # ==============================================================================
     # 5. EXIT LOGIC
