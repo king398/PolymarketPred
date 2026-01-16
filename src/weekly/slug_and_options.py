@@ -167,6 +167,44 @@ def parse_prices(market):
     if isinstance(raw, str): return ast.literal_eval(raw)
     return [float(p) for p in raw]
 
+def is_market_expired(market_end: str) -> bool:
+    """Returns True if market_end (ISO string) is in the past."""
+    try:
+        end_dt = datetime.fromisoformat(market_end)
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=timezone.utc)
+        return end_dt.astimezone(timezone.utc) <= datetime.now(timezone.utc)
+    except Exception:
+        return False
+
+def prune_expired_markets(file_path: str) -> int:
+    """Rewrites file without expired markets. Returns number removed."""
+    if not os.path.exists(file_path):
+        return 0
+
+    kept = []
+    removed = 0
+    with open(file_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+                market_end = data.get("market_end")
+                if market_end and is_market_expired(market_end):
+                    removed += 1
+                    continue
+            except Exception:
+                pass
+            kept.append(line)
+
+    with open(file_path, "w") as f:
+        for line in kept:
+            f.write(line + "\n")
+
+    return removed
+
 
 # -----------------------------------------------------------------------------
 # MARKET DISCOVERY (PRODUCER)
@@ -224,6 +262,8 @@ async def process_weekly_markets(session, count):
 
         for (slug, pos, start_ts, end_ts), data in zip(tasks, responses):
             if not data or "markets" not in data: continue
+            if end_ts.astimezone(timezone.utc) <= datetime.now(timezone.utc):
+                continue
 
             for market in data["markets"]:
                 try:
@@ -389,6 +429,10 @@ async def main():
 
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR)
+
+    removed = prune_expired_markets(MARKET_ID_FILE)
+    if removed:
+        log.info(f"🧹 Removed {removed} expired markets from file.")
 
     if os.path.exists(MARKET_ID_FILE):
         with open(MARKET_ID_FILE, 'r') as f:

@@ -122,14 +122,16 @@ async def stream_iv(targets):
                             r=RISK_FREE_RATE,
                             sigma=sigma,
                         )
-
+                        output = {"instrument": instrument_name, "iv_percent": mark_iv_percent,
+                                  "digital_price": digital_price, "latency_ms": latency,
+                                  "slug": option_map[instrument_name]['slug']}
                         print(
                             f"{instrument_name:<25} | "
                             f"IV: {mark_iv_percent:>5.2f}% | "
                             f"S: {underlying_price:>7.2f} | "
                             f"K: {strike:>7.0f} | "
-                            f"Digital Price: ${digital_price:.4f}"
-                            f" | Latency: {latency :.1f} ms"
+                            f"Digital Price: ${digital_price:.4f} |"
+                            f"Latency: {latency :.1f} ms"
                         )
                     else:
                         print(f"Skipping calc for {instrument_name} (Missing data or expired)")
